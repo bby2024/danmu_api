@@ -471,7 +471,8 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
 
   // GET /api/v2/search/anime
   if (path === "/api/v2/search/anime" && method === "GET") {
-    return searchAnime(url);
+    // 公共搜索接口保持原 URL/参数不变，但默认走轻量摘要模式，避免大结果集提前展开并写入全部剧集。
+    return searchAnime(url, null, null, null, { lazySearch: true });
   }
 
   // GET /api/v2/search/episodes
@@ -491,7 +492,7 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
 
   // GET /api/v2/bangumi/:animeId
   if (path.startsWith("/api/v2/bangumi/") && method === "GET") {
-    return getBangumi(path);
+    return getBangumi(path, null, url.searchParams.get('source'));
   }
 
   // GET /api/v2/comment/:commentId/duration

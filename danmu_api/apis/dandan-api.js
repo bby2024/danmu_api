@@ -12,7 +12,9 @@ import {
 } from "../utils/cache-util.js";
 import { formatDanmuResponse, convertToDanmakuJson } from "../utils/danmu-util.js";
 import { applyOffset, resolveOffsetRule } from "../utils/offset-util.js";
-import { extractEpisodeTitle, convertChineseNumber, parseFileName, createDynamicPlatformOrder, normalizeSpaces, stripInvisibleChars, extractYear, titleMatches, extractAnimeInfo, extractSeasonNumberFromAnimeTitle, extractAnimeTitle, normalizeTitleForComparison, sanitizeSearchKeyword, normalizeUnicodeWhitespace, splitTitleAndTrailingSeasonEpisode } from "../utils/common-util.js";
+import { extractEpisodeTitle, convertChineseNumber, parseFileName, createDynamicPlatformOrder, normalizeSpaces, stripInvisibleChars, extractYear, titleMatches, extractAnimeInfo, extractSeasonNumberFromAnimeTitle, extractAnimeTitle, normalizeTitleForComparison, sanitizeSearchKeyword, normalizeUnicodeWhitespace, splitTitleAndTrailingSeasonEpisode, preferSeasonCandidatesIfPresent } from "../utils/common-util.js";
+import { generateValidStartDate } from "../utils/time-util.js";
+import { convertToAsciiSum } from "../utils/codec-util.js";
 import { getTMDBChineseTitle } from "../utils/tmdb-util.js";
 import { applyMergeLogic, mergeDanmakuList, MERGE_DELIMITER, alignSourceTimelines } from "../utils/merge-util.js";
 import { getHanjutvSourceLabel, HANJUTV_FULL_EPISODE_FALLBACK_SEGMENT_DATA } from "../utils/hanjutv-util.js";
@@ -76,6 +78,8 @@ const tmdbSource = new TmdbSource(doubanSource);
 const PENDING_DANMAKU_REQUESTS = new Map();
 // 用于弹幕请求(按集ID/URL)的去重Map
 const PENDING_COMMENT_REQUESTS = new Map();
+// 用于懒详情物化的去重Map，避免同一条目被并发 /bangumi 请求重复打源
+const PENDING_LAZY_DETAIL_MATERIALIZATIONS = new Map();
 let nodeDnsLookup = null;
 
 function normalizeDurationValue(rawValue) {
@@ -237,6 +241,9 @@ function resolveDanmuOffsetRule(context = {}) {
 }
 
 function resolveSourceInstance(sourceName) {
+  if (sourceName === '360') return kan360Source;
+  if (sourceName === 'tmdb') return tmdbSource;
+  if (sourceName === 'douban') return doubanSource;
   if (sourceName === 'renren') return renrenSource;
   if (sourceName === 'hanjutv') return hanjutvSource;
   if (sourceName === 'bahamut') return bahamutSource;
@@ -258,6 +265,562 @@ function resolveSourceInstance(sourceName) {
   if (sourceName === 'custom') return customSource;
   if (sourceName === 'other_server') return otherSource;
   return null;
+}
+
+function getLazyDetailDescriptorStore() {
+  if (!(globals.lazyDetailDescriptors instanceof Map)) {
+    globals.lazyDetailDescriptors = new Map();
+  }
+  return globals.lazyDetailDescriptors;
+}
+
+function isLazyDetailDescriptorExpired(descriptor) {
+  const createdAt = Number(descriptor?.createdAt || 0);
+  if (!createdAt) return true;
+  const ttlMinutes = Number(globals.searchCacheMinutes || 0);
+  if (!Number.isFinite(ttlMinutes) || ttlMinutes <= 0) return false;
+  return (Date.now() - createdAt) / (1000 * 60) > ttlMinutes;
+}
+
+function removeLazyDetailDescriptor(descriptor) {
+  const store = getLazyDetailDescriptorStore();
+  for (const [key, value] of store.entries()) {
+    if (value === descriptor) {
+      store.delete(key);
+    }
+  }
+}
+
+function buildLazyDescriptorKey(source, id) {
+  const normalizedSource = String(source || '').trim().toLowerCase();
+  const normalizedId = String(id ?? '').trim();
+  if (!normalizedSource || !normalizedId) return null;
+  return `${normalizedSource}:${normalizedId}`;
+}
+
+function normalizeVodPlatform(platform) {
+  if (platform === 'mgtv') return 'imgo';
+  if (platform === 'bilibili') return 'bilibili1';
+  return platform;
+}
+
+function buildVodLinksFromRawCandidate(rawCandidate) {
+  if (!rawCandidate?.vod_play_from || !rawCandidate?.vod_play_url) return [];
+
+  const vodPlayFromList = String(rawCandidate.vod_play_from).split('$$$').map(normalizeVodPlatform);
+  const vodPlayUrlList = String(rawCandidate.vod_play_url).split('$$$');
+  const links = [];
+  let count = 0;
+
+  vodPlayFromList.forEach((platform, index) => {
+    if (!globals.vodAllowedPlatforms.includes(platform)) return;
+    const playUrl = vodPlayUrlList[index];
+    if (!playUrl) return;
+
+    for (const ep of playUrl.split('#')) {
+      const [episodeName, episodeUrl] = String(ep || '').split('$');
+      if (!episodeName || !episodeUrl) continue;
+      count++;
+      links.push({
+        name: String(count),
+        url: episodeUrl,
+        title: `【${platform}】 ${episodeName}`,
+      });
+    }
+  });
+
+  return links;
+}
+
+function buildVodAnimeFromLazyDescriptor(descriptor, includeLinks = false) {
+  const rawCandidate = descriptor?.rawCandidate || {};
+  const links = buildVodLinksFromRawCandidate(rawCandidate);
+  if (links.length === 0) return null;
+
+  const anime = {
+    animeId: Number(rawCandidate.vod_id),
+    bangumiId: String(rawCandidate.vod_id),
+    animeTitle: `${rawCandidate.vod_name}(${rawCandidate.vod_year})【${rawCandidate.type_name}】from ${descriptor.vodName}`,
+    type: rawCandidate.type_name,
+    typeDescription: rawCandidate.type_name,
+    imageUrl: rawCandidate.vod_pic,
+    startDate: generateValidStartDate(rawCandidate.vod_year),
+    episodeCount: links.length,
+    rating: 0,
+    isFavorited: true,
+    source: 'vod',
+  };
+
+  return includeLinks ? { ...anime, links } : anime;
+}
+
+function getRawCandidateId(rawCandidate, sourceName = '') {
+  const id = extractRawCandidateIdentity(rawCandidate, sourceName);
+  if (id === undefined || id === null || id === '') return null;
+  return String(id);
+}
+
+function buildDandanLinksFromEpisodes(episodes) {
+  if (!Array.isArray(episodes)) return [];
+
+  return episodes
+    .filter(ep => ep?.episodeId !== undefined && ep?.episodeId !== null)
+    .map((ep) => {
+      const epTitle = ep.episodeTitle && String(ep.episodeTitle).trim() !== "" ? `${ep.episodeTitle}` : `第${ep.episodeNumber}集`;
+      return {
+        name: epTitle,
+        url: ep.episodeId.toString(),
+        title: `【dandan】 ${epTitle}`,
+      };
+    });
+}
+
+function resolveDandanYear(rawCandidate, details, links) {
+  const rawDate = rawCandidate?.startDate || (Array.isArray(details?.episodes) && details.episodes[0]?.airDate) || '';
+  if (rawDate) {
+    const year = new Date(rawDate).getFullYear();
+    if (Number.isFinite(year)) return String(year);
+  }
+
+  const titleYear = extractYear(rawCandidate?.animeTitle || rawCandidate?.title || '');
+  return titleYear || '未知';
+}
+
+function buildDandanAnimeFromLazyDescriptor(descriptor, details = null, includeLinks = false) {
+  const rawCandidate = descriptor?.rawCandidate || {};
+  const rawId = getRawCandidateId(rawCandidate);
+  if (!rawId) return null;
+
+  const episodes = Array.isArray(details?.episodes) ? details.episodes : [];
+  const links = includeLinks ? buildDandanLinksFromEpisodes(episodes) : [];
+  if (includeLinks && links.length === 0) return null;
+
+  const displayTitle = rawCandidate._displayTitle || rawCandidate.animeTitle || rawCandidate.title || rawId;
+  const resolvedType = details?.type || rawCandidate.type || 'tvseries';
+  const resolvedTypeDescription = details?.typeDescription || rawCandidate.typeDescription || 'TV动画';
+  const resolvedStartDate = rawCandidate.startDate || (episodes.length > 0 ? episodes[0].airDate : null);
+  const yearStr = resolveDandanYear(rawCandidate, details, links);
+  const aliases = [...new Set([
+    ...(Array.isArray(details?.titles) ? details.titles : []),
+    ...(Array.isArray(rawCandidate.aliases) ? rawCandidate.aliases : []),
+  ].filter(Boolean))];
+  if (rawCandidate.animeTitle && rawCandidate.animeTitle !== displayTitle && !aliases.includes(rawCandidate.animeTitle)) {
+    aliases.push(rawCandidate.animeTitle);
+  }
+
+  const episodeCount = includeLinks
+    ? links.length
+    : Number(rawCandidate.episodeCount || (Array.isArray(rawCandidate.episodes) ? rawCandidate.episodes.length : 0) || 0);
+
+  const anime = {
+    animeId: Number(rawId),
+    bangumiId: rawId,
+    animeTitle: `${displayTitle}(${yearStr})【${resolvedTypeDescription}】from dandan`,
+    aliases,
+    type: resolvedType,
+    typeDescription: resolvedTypeDescription,
+    imageUrl: details?.imageUrl || rawCandidate.imageUrl || '',
+    startDate: resolvedStartDate,
+    episodeCount,
+    rating: rawCandidate.rating || 0,
+    isFavorited: rawCandidate.isFavorited ?? true,
+    source: 'dandan',
+  };
+
+  return includeLinks ? { ...anime, links } : anime;
+}
+
+function registerLazyDescriptor(descriptor, summary) {
+  if (!summary) return null;
+
+  descriptor.identityIds = [...new Set([
+    ...(Array.isArray(descriptor.identityIds) ? descriptor.identityIds : []),
+    summary.animeId,
+    summary.bangumiId,
+  ].filter(value => value !== undefined && value !== null && value !== '').map(String))];
+
+  const store = getLazyDetailDescriptorStore();
+  const animeKey = buildLazyDescriptorKey(descriptor.source, summary.animeId);
+  const bangumiKey = buildLazyDescriptorKey(descriptor.source, summary.bangumiId);
+  if (animeKey) store.set(animeKey, descriptor);
+  if (bangumiKey) store.set(bangumiKey, descriptor);
+  return summary;
+}
+
+function registerLazyVodDescriptor(rawCandidate, queryTitle, querySeason, vodName) {
+  const descriptor = {
+    kind: 'lazy-detail',
+    source: 'vod',
+    rawCandidate: { ...rawCandidate },
+    queryTitle,
+    querySeason,
+    vodName,
+    createdAt: Date.now(),
+  };
+  const summary = buildVodAnimeFromLazyDescriptor(descriptor, false);
+  return registerLazyDescriptor(descriptor, summary);
+}
+
+function registerLazyDandanDescriptor(rawCandidate, queryTitle, querySeason) {
+  const descriptor = {
+    kind: 'lazy-detail',
+    source: 'dandan',
+    rawCandidate: { ...rawCandidate },
+    queryTitle,
+    querySeason,
+    createdAt: Date.now(),
+  };
+  const summary = buildDandanAnimeFromLazyDescriptor(descriptor, null, false);
+  return registerLazyDescriptor(descriptor, summary);
+}
+
+function buildLazyVodSearchSummaries(vodCandidates, queryTitle, querySeason, vodName) {
+  if (!Array.isArray(vodCandidates)) return [];
+
+  const seasonPreferredAnimes = preferSeasonCandidatesIfPresent(vodCandidates, querySeason, anime => anime?.vod_name || '');
+  return seasonPreferredAnimes
+    .filter(anime => titleMatches(anime?.vod_name || '', queryTitle))
+    .map(anime => registerLazyVodDescriptor(anime, queryTitle, querySeason, vodName))
+    .filter(Boolean);
+}
+
+function buildLazyDandanSearchSummaries(dandanCandidates, queryTitle, querySeason) {
+  if (!Array.isArray(dandanCandidates)) return [];
+
+  const seasonPreferredAnimes = preferSeasonCandidatesIfPresent(dandanCandidates, querySeason, anime => anime?._displayTitle || anime?.animeTitle || anime?.title || '');
+  return seasonPreferredAnimes
+    .filter(anime => titleMatches(anime?._displayTitle || anime?.animeTitle || anime?.title || '', queryTitle))
+    .map(anime => registerLazyDandanDescriptor(anime, queryTitle, querySeason))
+    .filter(Boolean);
+}
+
+function isGenericLazySourceSupported(sourceName) {
+  if (!sourceName || sourceName === 'vod' || sourceName === 'dandan') return false;
+  const source = resolveSourceInstance(sourceName);
+  return Boolean(source && typeof source.handleAnimes === 'function');
+}
+
+function firstNonEmptyValue(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null && String(value).trim() !== '') {
+      return value;
+    }
+  }
+  return null;
+}
+
+function extractRawCandidateIdentity(rawCandidate, sourceName = '') {
+  if (sourceName === 'xigua' && rawCandidate?.url) {
+    const id = String(rawCandidate.url).split('?')[0].split('/').filter(Boolean).pop();
+    if (id) return id;
+  }
+
+  return firstNonEmptyValue(
+    rawCandidate?.bangumiId,
+    rawCandidate?.mediaId,
+    rawCandidate?.animeId,
+    rawCandidate?.id,
+    rawCandidate?.seasonId,
+    rawCandidate?.subjectId,
+    rawCandidate?.cid,
+    rawCandidate?.tvid,
+    rawCandidate?.epsId,
+    rawCandidate?.url,
+    rawCandidate?.vod_id
+  );
+}
+
+function buildLazySummaryAnimeId(rawCandidate, identity) {
+  if (rawCandidate?.animeId !== undefined && rawCandidate?.animeId !== null && rawCandidate?.animeId !== '') {
+    const numericAnimeId = Number(rawCandidate.animeId);
+    return Number.isFinite(numericAnimeId) ? numericAnimeId : convertToAsciiSum(String(rawCandidate.animeId));
+  }
+  if (identity === undefined || identity === null || identity === '') return null;
+  return convertToAsciiSum(String(identity));
+}
+
+function extractRawCandidateTitle(rawCandidate, fallbackId = '') {
+  return String(firstNonEmptyValue(
+    rawCandidate?._displayTitle,
+    rawCandidate?.animeTitle,
+    rawCandidate?.title,
+    rawCandidate?.name_cn,
+    rawCandidate?.cnName,
+    rawCandidate?.titleTxt,
+    rawCandidate?.name,
+    rawCandidate?.vod_name,
+    rawCandidate?.subjectTitle,
+    rawCandidate?.jpName,
+    fallbackId
+  ) || '').trim();
+}
+
+function extractRawCandidateYear(rawCandidate, title = '') {
+  const rawYear = firstNonEmptyValue(
+    rawCandidate?.year,
+    rawCandidate?.vod_year,
+    rawCandidate?.releaseYear,
+    rawCandidate?.publishYear,
+    rawCandidate?.pubYear
+  );
+  if (rawYear !== null) return String(rawYear);
+  const rawDate = firstNonEmptyValue(
+    rawCandidate?.startDate,
+    rawCandidate?.airDate,
+    rawCandidate?.pubdate,
+    rawCandidate?.pubtime,
+    rawCandidate?.publishTime,
+    rawCandidate?.publish_time,
+    rawCandidate?.releaseTime,
+    rawCandidate?.release_time,
+    rawCandidate?.releaseDate,
+    rawCandidate?.release_date
+  );
+  if (rawDate !== null) {
+    const parsed = new Date(rawDate).getFullYear();
+    if (Number.isFinite(parsed)) return String(parsed);
+    const textYear = String(rawDate).match(/(?:19|20)\d{2}/)?.[0];
+    if (textYear) return textYear;
+  }
+  return extractYear(title) || 'N/A';
+}
+
+function extractRawCandidateType(rawCandidate) {
+  return String(firstNonEmptyValue(
+    rawCandidate?.typeDescription,
+    rawCandidate?.type,
+    rawCandidate?.type_name,
+    rawCandidate?.cat_name,
+    rawCandidate?.classify,
+    rawCandidate?.categoryName,
+    rawCandidate?.mediaType,
+    rawCandidate?.category,
+    rawCandidate?.channel,
+    '未知'
+  ));
+}
+
+function extractRawCandidateImage(rawCandidate) {
+  return String(firstNonEmptyValue(
+    rawCandidate?.imageUrl,
+    rawCandidate?.vod_pic,
+    rawCandidate?.img,
+    rawCandidate?.imgUrl,
+    rawCandidate?.cover,
+    rawCandidate?.coverUrl,
+    rawCandidate?.coverImageH,
+    rawCandidate?.coverImageV,
+    rawCandidate?.poster,
+    rawCandidate?.pic,
+    rawCandidate?.horizontal_picture,
+    rawCandidate?.image?.thumb,
+    rawCandidate?.image?.posterThumb,
+    rawCandidate?.image?.poster,
+    rawCandidate?.image?.url,
+    ''
+  ));
+}
+
+function extractRawCandidateEpisodeCount(rawCandidate, typeDescription = '') {
+  const count = Number(firstNonEmptyValue(
+    rawCandidate?.episodeCount,
+    rawCandidate?.ep_size,
+    rawCandidate?.episodesCount,
+    rawCandidate?.totalEpisode,
+    rawCandidate?.total,
+    rawCandidate?.total_video_count,
+    rawCandidate?.videoNum,
+    Array.isArray(rawCandidate?.episodes) ? rawCandidate.episodes.length : null,
+    Array.isArray(rawCandidate?._eps) ? rawCandidate._eps.length : null,
+    Array.isArray(rawCandidate?.seriesPlaylinks) ? rawCandidate.seriesPlaylinks.length : null,
+    null
+  ));
+  if (Number.isFinite(count) && count > 0) return count;
+  if (String(typeDescription).includes('电影')) return 1;
+  return 0;
+}
+
+function buildGenericLazySourceSummary(sourceName, rawCandidate) {
+  const identity = extractRawCandidateIdentity(rawCandidate, sourceName);
+  if (identity === null) return null;
+
+  const bangumiId = String(identity);
+  const animeId = buildLazySummaryAnimeId(rawCandidate, identity);
+  if (animeId === null) return null;
+
+  const title = extractRawCandidateTitle(rawCandidate, bangumiId);
+  if (!title) return null;
+  const year = extractRawCandidateYear(rawCandidate, title);
+  const source = resolveSourceInstance(sourceName);
+  const rawTypeDescription = extractRawCandidateType(rawCandidate);
+  const rawCategory = rawCandidate?.category;
+  const typeDescription = sourceName === 'hanjutv'
+    && rawCategory !== undefined
+    && rawCategory !== null
+    && Number.isFinite(Number(rawCategory))
+    && typeof source?.getCategory === 'function'
+    ? source.getCategory(rawCategory)
+    : rawTypeDescription;
+  const episodeCount = extractRawCandidateEpisodeCount(rawCandidate, typeDescription);
+  const aliases = [
+    ...(Array.isArray(rawCandidate?.aliases) ? rawCandidate.aliases : []),
+    rawCandidate?.org_title,
+    rawCandidate?.originalTitle,
+  ].filter(Boolean);
+
+  return {
+    animeId,
+    bangumiId,
+    animeTitle: `${title}(${year})【${typeDescription}】from ${sourceName}`,
+    aliases: [...new Set(aliases)],
+    type: rawCandidate?.type || typeDescription,
+    typeDescription,
+    imageUrl: extractRawCandidateImage(rawCandidate),
+    startDate: generateValidStartDate(year),
+    episodeCount,
+    rating: rawCandidate?.rating || 0,
+    isFavorited: rawCandidate?.isFavorited ?? true,
+    source: sourceName,
+  };
+}
+
+function registerLazyGenericSourceDescriptor(sourceName, rawCandidate, queryTitle, querySeason) {
+  const summary = buildGenericLazySourceSummary(sourceName, rawCandidate);
+  if (!summary) return null;
+  const descriptor = {
+    kind: 'lazy-detail',
+    source: sourceName,
+    rawCandidate: { ...rawCandidate },
+    queryTitle,
+    querySeason,
+    identityIds: [summary.animeId, summary.bangumiId],
+    createdAt: Date.now(),
+  };
+  return registerLazyDescriptor(descriptor, summary);
+}
+
+function buildLazyGenericSourceSearchSummaries(sourceName, sourceCandidates, queryTitle, querySeason) {
+  if (!Array.isArray(sourceCandidates) || !isGenericLazySourceSupported(sourceName)) return [];
+  const seasonPreferredAnimes = preferSeasonCandidatesIfPresent(sourceCandidates, querySeason, anime => extractRawCandidateTitle(anime));
+  return seasonPreferredAnimes
+    .filter(anime => titleMatches(extractRawCandidateTitle(anime), queryTitle))
+    .map(anime => registerLazyGenericSourceDescriptor(sourceName, anime, queryTitle, querySeason))
+    .filter(Boolean);
+}
+
+function descriptorCandidateIds(descriptor) {
+  const rawCandidate = descriptor?.rawCandidate || {};
+  const ids = [
+    ...(Array.isArray(descriptor?.identityIds) ? descriptor.identityIds : []),
+    rawCandidate.animeId,
+    rawCandidate.bangumiId,
+    rawCandidate.mediaId,
+    rawCandidate.id,
+    rawCandidate.seasonId,
+    rawCandidate.subjectId,
+    rawCandidate.cid,
+    rawCandidate.tvid,
+    rawCandidate.vod_id,
+  ];
+  return [...new Set(ids.filter(value => value !== undefined && value !== null && value !== '').map(String))];
+}
+
+function findLazyDetailDescriptor(idParam, source = null) {
+  const store = getLazyDetailDescriptorStore();
+  if (source) {
+    const descriptorKey = buildLazyDescriptorKey(source, idParam);
+    return descriptorKey ? store.get(descriptorKey) || null : null;
+  }
+
+  const normalizedId = String(idParam ?? '').trim();
+  if (!normalizedId) return null;
+
+  const seen = new Set();
+  for (const descriptor of store.values()) {
+    if (!descriptor || seen.has(descriptor)) continue;
+    seen.add(descriptor);
+    if (descriptorCandidateIds(descriptor).includes(normalizedId)) {
+      return descriptor;
+    }
+  }
+  return null;
+}
+
+function resolveFullAnimeFromDetailStoreOrRuntime(idParam, descriptor, detailStore = null) {
+  const ids = [idParam, ...descriptorCandidateIds(descriptor)];
+  for (const id of ids) {
+    if (id === undefined || id === null || id === '') continue;
+    const anime = resolveAnimeById(id, detailStore, descriptor.source) || resolveAnimeById(id, detailStore, null);
+    if (anime) return anime;
+  }
+  return null;
+}
+
+async function buildFullAnimeFromLazyDescriptor(descriptor, detailStore = null) {
+  if (descriptor?.source === 'vod') {
+    return buildVodAnimeFromLazyDescriptor(descriptor, true);
+  }
+
+  if (descriptor?.source === 'dandan') {
+    const id = getRawCandidateId(descriptor.rawCandidate);
+    if (!id) return null;
+    const details = await dandanSource.getEpisodes(id);
+    return buildDandanAnimeFromLazyDescriptor(descriptor, details, true);
+  }
+
+  const source = resolveSourceInstance(descriptor?.source);
+  if (!source || typeof source.handleAnimes !== 'function') return null;
+
+  const localCurAnimes = [];
+  const requestDetailStore = detailStore instanceof Map ? detailStore : new Map();
+  const sourceHandleOptions = {
+    detailStore: requestDetailStore,
+    querySeason: descriptor.querySeason,
+    preferAnimeId: getRawCandidateId(descriptor.rawCandidate, descriptor.source),
+    preferSource: descriptor.source,
+  };
+
+  await source.handleAnimes([descriptor.rawCandidate], descriptor.queryTitle || '', localCurAnimes, sourceHandleOptions);
+  const fullAnime = resolveFullAnimeFromDetailStoreOrRuntime(null, descriptor, requestDetailStore)
+    || localCurAnimes
+      .map(anime => resolveAnimeById(anime?.bangumiId || anime?.animeId, requestDetailStore, descriptor.source))
+      .find(Boolean)
+    || null;
+
+  return fullAnime ? { fullAnime, alreadyAdded: true } : null;
+}
+
+async function materializeLazyDetailDescriptor(idParam, detailStore = null, source = null) {
+  const descriptor = findLazyDetailDescriptor(idParam, source);
+  if (!descriptor) return null;
+  if (isLazyDetailDescriptorExpired(descriptor)) {
+    removeLazyDetailDescriptor(descriptor);
+    return null;
+  }
+
+  const pendingKey = `${descriptor.source}:${getRawCandidateId(descriptor.rawCandidate, descriptor.source) || idParam}`;
+  if (PENDING_LAZY_DETAIL_MATERIALIZATIONS.has(pendingKey)) {
+    return await PENDING_LAZY_DETAIL_MATERIALIZATIONS.get(pendingKey);
+  }
+
+  const materializeTask = (async () => {
+    const materialized = await buildFullAnimeFromLazyDescriptor(descriptor, detailStore);
+    const fullAnime = materialized?.fullAnime || materialized;
+    if (!fullAnime) return null;
+
+    if (!materialized?.alreadyAdded) {
+      addAnime(fullAnime, { detailStore: detailStore instanceof Map ? detailStore : null });
+      if (globals.animes.length > globals.MAX_ANIMES) removeEarliestAnime();
+    }
+    return resolveAnimeById(idParam, detailStore, descriptor.source) || fullAnime;
+  })();
+
+  PENDING_LAZY_DETAIL_MATERIALIZATIONS.set(pendingKey, materializeTask);
+  try {
+    return await materializeTask;
+  } finally {
+    PENDING_LAZY_DETAIL_MATERIALIZATIONS.delete(pendingKey);
+  }
 }
 
 async function applyDanmuOffsetByRule(danmus, offsetRule, targetUrl, logPrefix = '[Offset]') {
@@ -622,11 +1185,29 @@ export function matchSeason(anime, queryTitle, season) {
   return parsedSeason === season;
 }
 
-// Extracted function for GET /api/v2/search/anime
-export async function searchAnime(url, preferAnimeId = null, preferSource = null, detailStore = null) {
-  let queryTitle = sanitizeSearchKeyword(url.searchParams.get("keyword"));
-  log("info", `Search anime with keyword: ${queryTitle}`);
+function parsePositiveIntegerParam(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
 
+export function buildSearchCacheKey(queryTitle, querySeason = null, cacheMode = 'eager') {
+  const season = parsePositiveIntegerParam(querySeason);
+  const baseKey = season ? `search:${queryTitle}:season:${season}` : queryTitle;
+  return cacheMode === 'lazy' ? `lazy:${baseKey}` : baseKey;
+}
+
+// Extracted function for GET /api/v2/search/anime
+export async function searchAnime(url, preferAnimeId = null, preferSource = null, detailStore = null, options = {}) {
+  let queryTitle = sanitizeSearchKeyword(url.searchParams.get("keyword"));
+  let querySeason = parsePositiveIntegerParam(url.searchParams.get("season"));
+  log("info", `Search anime with keyword: ${queryTitle}${querySeason ? `, season: ${querySeason}` : ''}`);
+  const perfCollector = options?.perfCollector || null;
+  const totalPerfToken = perfCollector?.start('searchAnime.total', { keyword: queryTitle, querySeason });
+  let cacheHit = false;
+  let resultCount = 0;
+
+  try {
   // 关键字为空直接返回，不用多余查询
   if (queryTitle === "") {
     return jsonResponse({
@@ -645,10 +1226,39 @@ export async function searchAnime(url, preferAnimeId = null, preferSource = null
   }
 
   const requestAnimeDetailsMap = detailStore instanceof Map ? detailStore : new Map();
+  const lazySearch = options?.lazySearch === true;
+  const sourceHandleOptions = {
+    detailStore: requestAnimeDetailsMap,
+    querySeason,
+    preferAnimeId,
+    preferSource,
+    perfCollector,
+  };
+  const searchCacheKey = buildSearchCacheKey(queryTitle, querySeason, lazySearch ? 'lazy' : 'eager');
 
   // 检查搜索缓存
-  const cachedResults = getSearchCache(queryTitle, requestAnimeDetailsMap);
+  const cachePerfToken = perfCollector?.start('searchAnime.cache', { keyword: queryTitle, querySeason, cacheKey: searchCacheKey });
+  let cachedResults = getSearchCache(searchCacheKey, requestAnimeDetailsMap);
+  let cacheKeyUsed = searchCacheKey;
+
+  // `/match` 以前只按标题预热搜索缓存。为避免引入 season 参数后让旧缓存全部失效，
+  // 只允许 match 内部搜索显式启用无 season 旧缓存回退；直接 `/search/anime?season=...` 仍保持隔离。
+  if (!lazySearch && cachedResults === null && querySeason && options?.allowUnseasonedCacheFallback) {
+    const legacyCachedResults = getSearchCache(queryTitle, requestAnimeDetailsMap);
+    if (legacyCachedResults !== null) {
+      cachedResults = preferSeasonCandidatesIfPresent(legacyCachedResults, querySeason, anime => anime?.animeTitle || anime?.title || '');
+      cacheKeyUsed = queryTitle;
+    }
+  }
+
+  cacheHit = cachedResults !== null;
+  perfCollector?.end(cachePerfToken, {
+    hit: cacheHit,
+    cacheKeyUsed,
+    resultCount: Array.isArray(cachedResults) ? cachedResults.length : 0,
+  });
   if (cachedResults !== null) {
+    resultCount = cachedResults.length;
     return jsonResponse({
       errorCode: 0,
       success: true,
@@ -780,93 +1390,41 @@ export async function searchAnime(url, preferAnimeId = null, preferSource = null
       resultData[source] = results[index];  // 根据顺序赋值
     });
 
-    // 解构出返回的结果
-    const {
-      vod: animesVodResults, 360: animes360, tmdb: animesTmdb, douban: animesDouban, renren: animesRenren,
-      hanjutv: animesHanjutv, bahamut: animesBahamut, dandan: animesDandan, custom: animesCustom,
-      tencent: animesTencent, youku: animesYouku, iqiyi: animesIqiyi, imgo: animesImgo, bilibili: animesBilibili,
-      migu: animesMigu, acfun: animesAcfun, sohu: animesSohu, leshi: animesLeshi, xigua: animesXigua, maiduidui: animesMaiduidui,
-      aiyifan: animesAiyifan, animeko: animesAnimeko, ezdmw: animesEzdmw
-    } = resultData;
-
     // 按顺序处理每个来源的结果（单源处理失败不影响其它源）
     for (const key of globals.sourceOrderArr) {
       try {
-        if (key === '360') {
-          // 等待处理360来源
-          await kan360Source.handleAnimes(animes360, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'vod') {
-          // 等待处理Vod来源（遍历所有VOD服务器的结果）
+        if (lazySearch && isGenericLazySourceSupported(key)) {
+          curAnimes.push(...buildLazyGenericSourceSearchSummaries(key, resultData[key], queryTitle, querySeason));
+          continue;
+        }
+
+        if (key === 'vod') {
+          // Vod 结果按服务器分组，handleAnimes 需要保留 vodName 这个兼容位置参数。
+          const animesVodResults = resultData[key];
           if (animesVodResults && Array.isArray(animesVodResults)) {
             for (const vodResult of animesVodResults) {
               if (vodResult && vodResult.list && vodResult.list.length > 0) {
-                await vodSource.handleAnimes(vodResult.list, queryTitle, curAnimes, vodResult.serverName, requestAnimeDetailsMap);
+                if (lazySearch) {
+                  curAnimes.push(...buildLazyVodSearchSummaries(vodResult.list, queryTitle, querySeason, vodResult.serverName));
+                } else {
+                  await vodSource.handleAnimes(vodResult.list, queryTitle, curAnimes, vodResult.serverName, sourceHandleOptions);
+                }
               }
             }
           }
-        } else if (key === 'tmdb') {
-          // 等待处理TMDB来源
-          await tmdbSource.handleAnimes(animesTmdb, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'douban') {
-          // 等待处理Douban来源
-          await doubanSource.handleAnimes(animesDouban, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'renren') {
-          // 等待处理Renren来源
-          await renrenSource.handleAnimes(animesRenren, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'hanjutv') {
-          // 等待处理Hanjutv来源
-          await hanjutvSource.handleAnimes(animesHanjutv, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'bahamut') {
-          // 等待处理Bahamut来源
-          await bahamutSource.handleAnimes(animesBahamut, queryTitle, curAnimes, requestAnimeDetailsMap);
         } else if (key === 'dandan') {
-          // 等待处理弹弹play来源
-          await dandanSource.handleAnimes(animesDandan, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'custom') {
-          // 等待处理自定义弹幕源来源
-          await customSource.handleAnimes(animesCustom, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'tencent') {
-          // 等待处理Tencent来源
-          await tencentSource.handleAnimes(animesTencent, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'youku') {
-          // 等待处理Youku来源
-          await youkuSource.handleAnimes(animesYouku, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'iqiyi') {
-          // 等待处理iQiyi来源
-          await iqiyiSource.handleAnimes(animesIqiyi, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'imgo') {
-          // 等待处理Mango来源
-          await mangoSource.handleAnimes(animesImgo, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'bilibili') {
-          // 等待处理Bilibili来源
-          await bilibiliSource.handleAnimes(animesBilibili, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'migu') {
-          // 等待处理Migu来源
-          await miguSource.handleAnimes(animesMigu, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'sohu') {
-          // 等待处理Sohu来源
-          await sohuSource.handleAnimes(animesSohu, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'leshi') {
-          // 等待处理Leshi来源
-          await leshiSource.handleAnimes(animesLeshi, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'xigua') {
-          // 等待处理Xigua来源
-          await xiguaSource.handleAnimes(animesXigua, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'maiduidui') {
-          // 等待处理Maiduidui来源
-          await maiduiduiSource.handleAnimes(animesMaiduidui, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'acfun') {
-          // 等待处理Acfun来源
-          await acfunSource.handleAnimes(animesAcfun, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'aiyifan') {
-          // 等待处理Aiyifan来源
-          await aiyifanSource.handleAnimes(animesAiyifan, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'animeko') {
-          // 等待处理Animeko来源
-          await animekoSource.handleAnimes(animesAnimeko, queryTitle, curAnimes, requestAnimeDetailsMap);
-        } else if (key === 'ezdmw') {
-          // 等待E站弹幕网来源
-          await ezdmwSource.handleAnimes(animesEzdmw, queryTitle, curAnimes, requestAnimeDetailsMap);
+          // 公共懒搜索只返回摘要，不在搜索阶段 fanout /bangumi 详情。
+          const animesDandan = resultData[key];
+          if (lazySearch) {
+            curAnimes.push(...buildLazyDandanSearchSummaries(animesDandan, queryTitle, querySeason));
+          } else {
+            await dandanSource.handleAnimes(animesDandan, queryTitle, curAnimes, sourceHandleOptions);
+          }
+        } else {
+          const source = resolveSourceInstance(key);
+          if (source && typeof source.handleAnimes === 'function') {
+            await source.handleAnimes(resultData[key], queryTitle, curAnimes, sourceHandleOptions);
+          }
         }
       } catch (sourceError) {
         const reason = sourceError?.message || String(sourceError || "unknown error");
@@ -878,14 +1436,14 @@ export async function searchAnime(url, preferAnimeId = null, preferSource = null
   }
 
   // 执行源合并逻辑
-  if (globals.mergeSourcePairs.length > 0) {
+  if (!lazySearch && globals.mergeSourcePairs.length > 0) {
     await applyMergeLogic(curAnimes, requestAnimeDetailsMap);
   }
 
   storeAnimeIdsToMap(curAnimes, queryTitle);
 
   // 如果启用了集标题过滤，则为每个动漫添加过滤后的 episodes
-  if (globals.enableAnimeEpisodeFilter) {
+  if (!lazySearch && globals.enableAnimeEpisodeFilter) {
     const validAnimes = [];
     for (const anime of curAnimes) {
       // 首先检查剧名是否包含过滤关键词
@@ -935,17 +1493,23 @@ export async function searchAnime(url, preferAnimeId = null, preferSource = null
     await updateLocalRedisCaches();
   }
 
-  // 缓存搜索结果
-  if (curAnimes.length > 0) {
-    setSearchCache(queryTitle, curAnimes, requestAnimeDetailsMap);
+  const responseAnimes = curAnimes.map(({ links, ...pureAnime }) => pureAnime);
+
+  // 缓存搜索结果；详情 links 已通过 requestAnimeDetailsMap/animeDetailsCache 保存，响应缓存只保留摘要。
+  if (responseAnimes.length > 0) {
+    setSearchCache(searchCacheKey, responseAnimes, requestAnimeDetailsMap);
   }
 
+  resultCount = responseAnimes.length;
   return jsonResponse({
     errorCode: 0,
     success: true,
     errorMessage: "",
-    animes: curAnimes,
+    animes: responseAnimes,
   });
+  } finally {
+    perfCollector?.end(totalPerfToken, { cacheHit, resultCount });
+  }
 }
 
 function filterSameEpisodeTitle(filteredTmpEpisodes) {
@@ -1694,8 +2258,14 @@ function summarizeMatchDebugAnimeCandidate(anime) {
   };
 }
 
-function buildMatchSearchUrl(url, title) {
-  return new URL(`/api/v2/search/anime?keyword=${encodeURIComponent(title)}`, url.origin);
+export function buildMatchSearchUrl(url, title, season = null) {
+  const searchUrl = new URL('/api/v2/search/anime', url.origin);
+  searchUrl.searchParams.set('keyword', title || '');
+  const numericSeason = Number(season);
+  if (Number.isInteger(numericSeason) && numericSeason > 0) {
+    searchUrl.searchParams.set('season', String(numericSeason));
+  }
+  return searchUrl;
 }
 
 function deriveMatchFinalReasonCode(debugCollector, fallbackReasonCode) {
@@ -1873,9 +2443,15 @@ export async function matchAnime(url, req, clientIp = null) {
         selectedEpisodeTitle: null
       });
     } else {
-      const originSearchUrl = buildMatchSearchUrl(url, title);
-      log("info", `[matchAnime] 开始搜索候选: title=${title}`);
-      const searchRes = await searchAnime(originSearchUrl, preferAnimeId, preferSource, requestAnimeDetailsMap);
+      const originSearchUrl = buildMatchSearchUrl(url, title, season);
+      log("info", `[matchAnime] 开始搜索候选: title=${title}, season=${season || 'N/A'}`);
+      const searchRes = await searchAnime(
+        originSearchUrl,
+        preferAnimeId,
+        preferSource,
+        requestAnimeDetailsMap,
+        { allowUnseasonedCacheFallback: true }
+      );
       const searchData = await searchRes.json();
       const rawAnimes = Array.isArray(searchData?.animes) ? searchData.animes : [];
       log("info", `[matchAnime] 搜索候选数量: ${rawAnimes.length}`);
@@ -2145,7 +2721,10 @@ export async function searchEpisodes(url) {
 // Extracted function for GET /api/v2/bangumi/:animeId
 export async function getBangumi(path, detailStore = null, source = null) {
   const idParam = path.split("/").pop();
-  const anime = resolveAnimeById(idParam, detailStore, source);
+  let anime = resolveAnimeById(idParam, detailStore, source);
+  if (!anime) {
+    anime = await materializeLazyDetailDescriptor(idParam, detailStore, source);
+  }
 
   if (!anime) {
     log("error", `Anime with ID ${idParam} not found`);

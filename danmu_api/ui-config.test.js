@@ -24,6 +24,39 @@ test('MATCH_PLATFORM_RULES config should parse valid platform order rules and ig
   ]);
 });
 
+test('source detail concurrency should be configurable by environment variables', () => {
+  const config = Globals.init({
+    SOURCE_DETAIL_CONCURRENCY: '6',
+    SOURCE_DETAIL_CONCURRENCY_BY_SOURCE: 'tencent:2,vod:3,bad,iqiyi:99,sohu:0,unknown:4'
+  });
+
+  assert.equal(config.sourceDetailConcurrency, 6);
+  assert.deepEqual(config.sourceDetailConcurrencyBySource, {
+    tencent: 2,
+    vod: 3,
+    iqiyi: 16
+  });
+  assert.equal(config.envVarConfig.SOURCE_DETAIL_CONCURRENCY.type, 'number');
+  assert.equal(config.envVarConfig.SOURCE_DETAIL_CONCURRENCY_BY_SOURCE.type, 'text');
+});
+
+test('invalid source detail concurrency env values should fall back safely', () => {
+  const config = Globals.init({
+    SOURCE_DETAIL_CONCURRENCY: 'not-a-number',
+    SOURCE_DETAIL_CONCURRENCY_BY_SOURCE: 'tencent:-1,vod:abc,iqiyi:0,youku:5'
+  });
+
+  assert.equal(config.sourceDetailConcurrency, 4);
+  assert.deepEqual(config.sourceDetailConcurrencyBySource, { youku: 5 });
+});
+
+test('cache minutes UI config should allow 0 as disabled', () => {
+  const config = Globals.init({});
+
+  assert.equal(config.envVarConfig.SEARCH_CACHE_MINUTES.min, 0);
+  assert.equal(config.envVarConfig.COMMENT_CACHE_MINUTES.min, 0);
+});
+
 test('API test UI should expose a debug toggle for matchAnime', () => {
   assert.match(
     apitestJsContent,

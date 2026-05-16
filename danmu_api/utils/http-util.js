@@ -62,6 +62,13 @@ function getHttpStatusFromError(error) {
   return match ? Number(match[1]) : null;
 }
 
+function isAllowedHttpStatus(response, options = {}) {
+  const validStatusCodes = Array.isArray(options.validStatusCodes)
+    ? options.validStatusCodes.map(Number).filter(Number.isFinite)
+    : [];
+  return response?.ok || validStatusCodes.includes(Number(response?.status));
+}
+
 function resolveHttpErrorLevel(error) {
   if (!error) return 'error';
   if (error.name === 'AbortError') return 'warn';
@@ -145,7 +152,7 @@ export async function httpGet(url, options = {}) {
 
       clearTimeout(timeoutId);
 
-      if (!response.ok) {
+      if (!isAllowedHttpStatus(response, options)) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
 
@@ -335,7 +342,7 @@ export async function httpPost(url, body, options = {}) {
       const data = await response.text();
 
 
-      if (!response.ok) {
+      if (!isAllowedHttpStatus(response, options)) {
         log("debug", `[请求模拟] response data: `, data);
         throw new Error(`HTTP error! status: ${response.status}`);
       }
@@ -423,7 +430,7 @@ async function httpRequestMethod(method, url, body, options = {}) {
     const response = await fetchImpl(url, fetchOptions);
     const textData = await response.text();
 
-    if (!response.ok) {
+    if (!isAllowedHttpStatus(response, options)) {
       log("debug", `[请求模拟] response data: `, textData);
       throw new Error(`HTTP error! status: ${response.status}`);
     }
@@ -665,7 +672,7 @@ export async function httpGetWithStreamCheck(url, options = {}, checkCallback) {
       signal: controller.signal
     });
 
-    if (!response.ok) {
+    if (!isAllowedHttpStatus(response, options)) {
       throw new Error(`HTTP error! status: ${response.status}`);
     }
 
