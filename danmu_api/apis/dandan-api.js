@@ -361,6 +361,7 @@ function attachLazyDescriptorsToSearchCache(cacheKey, results) {
   if (descriptors.length > 0) {
     cacheEntry.lazyDetailDescriptors = descriptors;
   }
+  pruneLazyDetailDescriptors();
 }
 
 function rehydrateLazyDescriptorsFromSearchCache(cacheKey) {
@@ -386,14 +387,6 @@ function pruneLazyDetailDescriptors() {
     }
   }
 
-  const maxItems = Number(globals.searchCacheMaxItems || 200);
-  if (!Number.isFinite(maxItems) || maxItems <= 0) return;
-  const uniqueDescriptors = [...new Set(store.values())]
-    .sort((a, b) => Number(a?.createdAt || 0) - Number(b?.createdAt || 0));
-  while (uniqueDescriptors.length > maxItems) {
-    const descriptor = uniqueDescriptors.shift();
-    removeLazyDetailDescriptor(descriptor);
-  }
 }
 
 function buildVodScopedLazyId(vodName, rawId) {
@@ -549,7 +542,6 @@ function registerLazyDescriptor(descriptor, summary) {
   const bangumiKey = buildLazyDescriptorKey(descriptor.source, summary.bangumiId);
   if (animeKey) store.set(animeKey, descriptor);
   if (bangumiKey) store.set(bangumiKey, descriptor);
-  pruneLazyDetailDescriptors();
   return summary;
 }
 
@@ -682,7 +674,7 @@ function extractRawCandidateTitle(rawCandidate, fallbackId = '') {
     rawCandidate?.subjectTitle,
     rawCandidate?.jpName,
     fallbackId
-  ) || '').trim();
+  ) || '').replace(/^\s*--+>\s*/, '').trim();
 }
 
 function extractRawCandidateYear(rawCandidate, title = '') {
@@ -697,6 +689,10 @@ function extractRawCandidateYear(rawCandidate, title = '') {
   const rawDate = firstNonEmptyValue(
     rawCandidate?.startDate,
     rawCandidate?.airDate,
+    rawCandidate?.air_date,
+    rawCandidate?.date,
+    rawCandidate?.begin,
+    rawCandidate?.beginDate,
     rawCandidate?.pubdate,
     rawCandidate?.pubtime,
     rawCandidate?.publishTime,
@@ -743,6 +739,11 @@ function extractRawCandidateImage(rawCandidate) {
     rawCandidate?.poster,
     rawCandidate?.pic,
     rawCandidate?.horizontal_picture,
+    rawCandidate?.images?.common,
+    rawCandidate?.images?.large,
+    rawCandidate?.images?.medium,
+    rawCandidate?.images?.grid,
+    rawCandidate?.images?.small,
     rawCandidate?.image?.thumb,
     rawCandidate?.image?.posterThumb,
     rawCandidate?.image?.poster,
@@ -757,6 +758,10 @@ function extractRawCandidateEpisodeCount(rawCandidate, typeDescription = '') {
     rawCandidate?.ep_size,
     rawCandidate?.episodesCount,
     rawCandidate?.totalEpisode,
+    rawCandidate?.totalEpisodes,
+    rawCandidate?.total_episodes,
+    rawCandidate?.eps,
+    rawCandidate?.epCount,
     rawCandidate?.total,
     rawCandidate?.total_video_count,
     rawCandidate?.videoNum,

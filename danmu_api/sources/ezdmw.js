@@ -86,6 +86,22 @@ function parseStartDate(description = '') {
   return year === 'N/A' ? '' : `${year}-01-01`;
 }
 
+function parseStructuredYearStartDate(html = '') {
+  const yearLine = String(html).match(/【年份】[\s\S]{0,120}/)?.[0] || '';
+  if (!yearLine) return '';
+  return parseStartDate(stripHtml(yearLine));
+}
+
+function extractDetailImageUrl(html = '', base = EZDMW_BASE_URL) {
+  const imageTag = String(html).match(/<img\b(?=[^>]*\bclass\s*=\s*(["'])[^"']*\bfengmian\b[^"']*\1)[^>]*>/i)?.[0]
+    || String(html).match(/<img\b[^>]*\bfengmian\b[^>]*>/i)?.[0]
+    || '';
+  return absoluteUrl(
+    getAttr(imageTag, 'src') || getAttr(imageTag, 'data-src') || getAttr(imageTag, 'data-original') || getAttr(imageTag, 'data-lazy-src'),
+    base,
+  );
+}
+
 function resolveTypeDescription(title = '', description = '') {
   const text = `${title} ${description}`;
   if (/剧场版|劇場版|电影|movie/i.test(text)) return '剧场版';
@@ -167,11 +183,14 @@ export default class EzdmwSource extends BaseSource {
 
       const anchorHtml = match[5] || '';
       const pHtml = String(match[6] || '').replace(/<span\b[\s\S]*?<\/span>/gi, ' ');
-      const title = stripHtml(pHtml);
+      const title = stripHtml(pHtml).replace(/^\s*--+>\s*/, '');
       if (!title) continue;
 
-      const imageMatch = anchorHtml.match(/<img\b[^>]*src=["']([^"']+)["'][^>]*>/i);
-      const imageUrl = imageMatch ? absoluteUrl(imageMatch[1], this.BASE_URL) : '';
+      const imageTag = anchorHtml.match(/<img\b[^>]*>/i)?.[0] || '';
+      const imageUrl = absoluteUrl(
+        getAttr(imageTag, 'src') || getAttr(imageTag, 'data-src') || getAttr(imageTag, 'data-original') || getAttr(imageTag, 'data-lazy-src'),
+        this.BASE_URL,
+      );
 
       seen.add(id);
       results.push({
@@ -190,7 +209,8 @@ export default class EzdmwSource extends BaseSource {
     const titleTag = String(html).match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || '';
     const title = keywordsTitle || cleanTitleFromPageTitle(titleTag);
     const description = getMetaContent(html, 'description');
-    const startDate = parseStartDate(description);
+    const startDate = parseStructuredYearStartDate(html) || parseStartDate(description);
+    const imageUrl = extractDetailImageUrl(html, this.BASE_URL);
     const typeDescription = resolveTypeDescription(title, description);
     const episodes = [];
     const seen = new Set();
@@ -239,6 +259,7 @@ export default class EzdmwSource extends BaseSource {
       startDate,
       typeDescription,
       year: extractYear(startDate || description),
+      imageUrl,
       episodes,
     };
   }
@@ -299,12 +320,44 @@ export default class EzdmwSource extends BaseSource {
       url.searchParams.set('searchText', query);
       const html = await this.fetchText(url.toString(), this.BASE_URL);
       const results = this.parseSearchResults(html);
-      log('info', `[Ezdmw] 搜索找到 ${results.length} 个有效结果`);
-      return results;
+      const enrichedResults = await this.enrichSearchResults(results);
+      log('info', `[Ezdmw] 搜索找到 ${enrichedResults.length} 个有效结果`);
+      return enrichedResults;
     } catch (error) {
       log('warn', `[Ezdmw] 搜索失败: ${error.message}`);
       return [];
     }
+  }
+
+  async enrichSearchResults(results) {
+    if (!Array.isArray(results) || results.length === 0) return [];
+
+    const enrichedResults = await mapWithConcurrency(
+      results,
+      resolveSourceConcurrency('ezdmw', globals),
+      async (item) => {
+        const id = String(item?.id || '').trim();
+        if (!id) return item;
+
+        try {
+          const detail = await this.getBangumiDetail(id);
+          return {
+            ...item,
+            title: item.title || detail.title || '',
+            imageUrl: item.imageUrl || detail.imageUrl || '',
+            year: detail.year && detail.year !== 'N/A' ? detail.year : extractYear(detail.startDate || detail.description || item.title || ''),
+            startDate: detail.startDate || parseStructuredYearStartDate(detail.description || '') || '',
+            episodeCount: Array.isArray(detail.episodes) ? detail.episodes.length : 0,
+            typeDescription: detail.typeDescription || item.typeDescription || 'TV动画',
+          };
+        } catch (error) {
+          log('warn', `[Ezdmw] 预取搜索详情失败 ${id}: ${error.message}`);
+          return item;
+        }
+      }
+    );
+
+    return enrichedResults.filter(Boolean);
   }
 
   async getBangumiDetail(id) {

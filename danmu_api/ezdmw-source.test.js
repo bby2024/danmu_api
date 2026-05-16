@@ -20,6 +20,20 @@ const bangumiHtml = `
 <a class="circuit_switch1" href="/Index/video/98626.html"><span class="1">1</span></a>
 <a class="circuit_switch3" href="/Index/video/98627.html"><span class="无删01">01</span></a>`;
 
+const structuredMetadataHtml = `
+<title>咒术回战第三季在线观看&下载-E站弹幕网</title>
+<meta name="keywords" content="咒术回战第三季" />
+<img src="https://www.ezdmw.org/Public/atlas_oss/Public/images/some_img/2470.jpg" class="fengmian" />
+<h2>【类型】：漫改、热血、战斗、奇幻、神魔</h2>
+<h2>【年份】：2026年1月【全集完】</h2>
+<a class="circuit_switch1" href="/Index/video/96820.html"><span class="1">1</span></a>
+<a class="circuit_switch1" href="/Index/video/96821.html"><span class="2">2</span></a>`;
+
+const lazyImageSearchHtml = `
+<section class="some_drama">
+  <div><a href="/Index/bangumi/96820.html"><img data-original="https://www.ezdmw.org/Public/atlas_oss/Public/images/some_img/2470.jpg" class="img1" /></a><p><span class="play_some">3.2万</span>&nbsp;--> 咒术回战第三季</p></div>
+</section>`;
+
 const videoHtml = `
 <iframe src="https://player.ezdmw.com/danmuku/?nk=clksdysjsh4/clksdysjsh4_01&amp;name=clksdysjsh4/clksdysjsh4_01&amp;src=resource_name=clksdysjsh4_01&amp;up=true&amp;title=Re%EF%BC%9A%E4%BB%8E%E9%9B%B6%E5%BC%80%E5%A7%8B%E7%9A%84%E5%BC%82%E4%B8%96%E7%95%8C%E7%94%9F%E6%B4%BB%E7%AC%AC%E5%9B%9B%E5%AD%A3&amp;total=null&amp;timeAxis=false&amp;sign=f2a8151238a0951457510bd8b37b7314&amp;quarterly=2026%E5%B9%B44%E6%9C%88%E3%80%90%E8%BF%9E%E8%BD%BD%E4%B8%AD%E3%80%91"></iframe>`;
 
@@ -48,6 +62,19 @@ test('parses ezdmw search result html into bangumi candidates', () => {
   });
 });
 
+test('parses ezdmw search images from data-original and strips noisy title prefixes', () => {
+  const source = new EzdmwSource();
+  const results = source.parseSearchResults(lazyImageSearchHtml);
+
+  assert.equal(results.length, 1);
+  assert.deepEqual(results[0], {
+    id: '96820',
+    title: '咒术回战第三季',
+    detailUrl: 'https://m.ezdmw.site/Index/bangumi/96820.html',
+    imageUrl: 'https://www.ezdmw.org/Public/atlas_oss/Public/images/some_img/2470.jpg'
+  });
+});
+
 test('parses only primary ezdmw episode line and returns ascending episode order', () => {
   const source = new EzdmwSource();
   const detail = source.parseBangumiDetail(bangumiHtml, '98626');
@@ -63,6 +90,36 @@ test('parses only primary ezdmw episode line and returns ascending episode order
     'ezdmw://episode/99163',
     'ezdmw://episode/99316'
   ]);
+});
+
+test('parses ezdmw structured year poster and episode count from bangumi detail page', () => {
+  const source = new EzdmwSource();
+  const detail = source.parseBangumiDetail(structuredMetadataHtml, '96820');
+
+  assert.equal(detail.title, '咒术回战第三季');
+  assert.equal(detail.year, '2026');
+  assert.equal(detail.startDate, '2026-01-01');
+  assert.equal(detail.imageUrl, 'https://www.ezdmw.org/Public/atlas_oss/Public/images/some_img/2470.jpg');
+  assert.equal(detail.episodes.length, 2);
+});
+
+test('ezdmw search enriches lazy summaries with detail metadata', async () => {
+  class TestEzdmwSource extends EzdmwSource {
+    async fetchText(url) {
+      if (String(url).includes('/Index/search.html')) return lazyImageSearchHtml;
+      if (String(url).includes('/Index/bangumi/96820.html')) return structuredMetadataHtml;
+      return '';
+    }
+  }
+
+  const results = await new TestEzdmwSource().search('咒术回战');
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0].title, '咒术回战第三季');
+  assert.equal(results[0].imageUrl, 'https://www.ezdmw.org/Public/atlas_oss/Public/images/some_img/2470.jpg');
+  assert.equal(results[0].year, '2026');
+  assert.equal(results[0].startDate, '2026-01-01');
+  assert.equal(results[0].episodeCount, 2);
 });
 
 test('builds getData url from ezdmw player iframe params', () => {

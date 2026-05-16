@@ -161,6 +161,48 @@ test('lazy VOD search cache hit should restore descriptors before bangumi materi
   }
 });
 
+test('lazy VOD search should keep every returned result materializable beyond search cache max items', async () => {
+  resetRuntime();
+  Globals.searchCacheMaxItems = 300;
+  const rawCandidates = Array.from({ length: 350 }, (_, index) => ({
+    vod_id: 970000 + index,
+    vod_name: `宽搜索懒加载番剧 ${index}`,
+    vod_year: '2026',
+    type_name: 'TV动画',
+    vod_pic: `https://img.example/wide-${index}.jpg`,
+    vod_play_from: 'qq',
+    vod_play_url: `第1集$https://vod.example/wide/${index}/ep1`,
+  }));
+  const vodMock = mockVodFetch(rawCandidates);
+
+  try {
+    const response = await searchAnime(
+      new URL('https://example.test/api/v2/search/anime?keyword=%E5%AE%BD%E6%90%9C%E7%B4%A2%E6%87%92%E5%8A%A0%E8%BD%BD%E7%95%AA%E5%89%A7'),
+      null,
+      null,
+      new Map(),
+      { lazySearch: true }
+    );
+    const body = await response.json();
+
+    assert.equal(body.success, true);
+    assert.equal(body.animes.length, 350);
+    assert.equal(new Set(Globals.lazyDetailDescriptors.values()).size, 350);
+
+    const firstBangumi = await getBangumi('/api/v2/bangumi/970000', null, 'vod');
+    const firstBody = await firstBangumi.json();
+    assert.equal(firstBody.success, true, 'first returned lazy result should still be materializable');
+    assert.equal(firstBody.bangumi.bangumiId, '970000');
+
+    const lastBangumi = await getBangumi('/api/v2/bangumi/970349', null, 'vod');
+    const lastBody = await lastBangumi.json();
+    assert.equal(lastBody.success, true, 'last returned lazy result should be materializable');
+    assert.equal(lastBody.bangumi.bangumiId, '970349');
+  } finally {
+    vodMock.restore();
+  }
+});
+
 test('lazy VOD search should use source-aware bangumi ids when multiple servers return the same vod_id', async () => {
   resetRuntime();
   Globals.init({
@@ -655,6 +697,56 @@ test('lazy Hanjutv search summary should preserve nested poster and publish year
     assert.equal('links' in body.animes[0], false);
   } finally {
     HanjutvSource.prototype.search = originalSearch;
+  }
+});
+
+test('lazy Animeko summary should preserve Bangumi poster date and episode count metadata', async () => {
+  resetRuntime();
+  Globals.sourceOrderArr = ['animeko'];
+  Globals.useBangumiData = false;
+  const originalSearch = AnimekoSource.prototype.search;
+
+  AnimekoSource.prototype.search = async () => [{
+    id: 400602,
+    name: 'Sousou no Frieren',
+    name_cn: '葬送的芙莉莲',
+    images: {
+      common: 'https://lain.bgm.tv/pic/cover/c/7f/b2/400602.jpg',
+      large: 'https://lain.bgm.tv/pic/cover/l/7f/b2/400602.jpg',
+    },
+    air_date: '2023-09-29',
+    eps: 28,
+    total_episodes: 28,
+    score: 8.8,
+    typeDescription: 'TV动画',
+  }];
+
+  try {
+    const response = await handleRequest(
+      new Request('https://example.test/api/v2/search/anime?keyword=%E8%91%AC%E9%80%81%E7%9A%84%E8%8A%99%E8%8E%89%E8%8E%B2'),
+      {
+        LOG_LEVEL: 'error',
+        SOURCE_ORDER: 'animeko',
+        MERGE_SOURCE_PAIRS: '',
+        MAX_ANIMES: '1000',
+        SEARCH_CACHE_MINUTES: '30',
+        RATE_LIMIT_MAX_REQUESTS: '0',
+        USE_BANGUMI_DATA: 'false',
+      },
+      'test',
+      '127.0.0.1'
+    );
+    const body = await response.json();
+
+    assert.equal(body.success, true);
+    assert.equal(body.animes.length, 1);
+    assert.equal(body.animes[0].source, 'animeko');
+    assert.equal(body.animes[0].imageUrl, 'https://lain.bgm.tv/pic/cover/c/7f/b2/400602.jpg');
+    assert.equal(body.animes[0].startDate, '2023-01-01T00:00:00Z');
+    assert.equal(body.animes[0].episodeCount, 28);
+    assert.equal('links' in body.animes[0], false);
+  } finally {
+    AnimekoSource.prototype.search = originalSearch;
   }
 });
 

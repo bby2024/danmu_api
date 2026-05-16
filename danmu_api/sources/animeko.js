@@ -49,8 +49,10 @@ export default class AnimekoSource extends BaseSource {
             id: parseInt(m.siteId),
             name: m.title,
             name_cn: finalTitle,
-			imageUrl: "",
+            imageUrl: m.images?.common || m.images?.large || '',
             date: m.begin,
+            startDate: m.begin,
+            episodeCount: Number(m.eps || m.total_episodes || 0),
             score: 0,
             platform: m.typeStr,
             aliases: [...m.titles]
@@ -306,7 +308,10 @@ export default class AnimekoSource extends BaseSource {
         name_cn: (item.name_cn || item.name) + titleSuffix,
         aliases: aliases,
         images: item.images,
+        imageUrl: item.imageUrl || (item.images ? (item.images.common || item.images.large || item.images.medium || item.images.small || '') : ''),
         air_date: item.date,
+        startDate: item.date,
+        episodeCount: Number(item.eps || item.total_episodes || item.episodeCount || 0),
         score: item.score,
         typeDescription: typeDesc
       };
