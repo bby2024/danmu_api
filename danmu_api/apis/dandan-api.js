@@ -354,8 +354,8 @@ function buildVodAnimeFromLazyDescriptor(descriptor, includeLinks = false) {
   return includeLinks ? { ...anime, links } : anime;
 }
 
-function getRawCandidateId(rawCandidate) {
-  const id = rawCandidate?.animeId ?? rawCandidate?.bangumiId ?? rawCandidate?.mediaId ?? rawCandidate?.id ?? rawCandidate?.seasonId ?? rawCandidate?.subjectId ?? rawCandidate?.cid ?? rawCandidate?.tvid;
+function getRawCandidateId(rawCandidate, sourceName = '') {
+  const id = extractRawCandidateIdentity(rawCandidate, sourceName);
   if (id === undefined || id === null || id === '') return null;
   return String(id);
 }
@@ -509,7 +509,12 @@ function firstNonEmptyValue(...values) {
   return null;
 }
 
-function extractRawCandidateIdentity(rawCandidate) {
+function extractRawCandidateIdentity(rawCandidate, sourceName = '') {
+  if (sourceName === 'xigua' && rawCandidate?.url) {
+    const id = String(rawCandidate.url).split('?')[0].split('/').filter(Boolean).pop();
+    if (id) return id;
+  }
+
   return firstNonEmptyValue(
     rawCandidate?.bangumiId,
     rawCandidate?.mediaId,
@@ -519,6 +524,8 @@ function extractRawCandidateIdentity(rawCandidate) {
     rawCandidate?.subjectId,
     rawCandidate?.cid,
     rawCandidate?.tvid,
+    rawCandidate?.epsId,
+    rawCandidate?.url,
     rawCandidate?.vod_id
   );
 }
@@ -537,19 +544,38 @@ function extractRawCandidateTitle(rawCandidate, fallbackId = '') {
     rawCandidate?._displayTitle,
     rawCandidate?.animeTitle,
     rawCandidate?.title,
+    rawCandidate?.name_cn,
+    rawCandidate?.cnName,
+    rawCandidate?.titleTxt,
     rawCandidate?.name,
     rawCandidate?.vod_name,
     rawCandidate?.subjectTitle,
-    rawCandidate?.cnName,
     rawCandidate?.jpName,
     fallbackId
   ) || '').trim();
 }
 
 function extractRawCandidateYear(rawCandidate, title = '') {
-  const rawYear = firstNonEmptyValue(rawCandidate?.year, rawCandidate?.vod_year, rawCandidate?.releaseYear);
+  const rawYear = firstNonEmptyValue(
+    rawCandidate?.year,
+    rawCandidate?.vod_year,
+    rawCandidate?.releaseYear,
+    rawCandidate?.publishYear,
+    rawCandidate?.pubYear
+  );
   if (rawYear !== null) return String(rawYear);
-  const rawDate = firstNonEmptyValue(rawCandidate?.startDate, rawCandidate?.airDate, rawCandidate?.pubdate, rawCandidate?.pubtime);
+  const rawDate = firstNonEmptyValue(
+    rawCandidate?.startDate,
+    rawCandidate?.airDate,
+    rawCandidate?.pubdate,
+    rawCandidate?.pubtime,
+    rawCandidate?.publishTime,
+    rawCandidate?.publish_time,
+    rawCandidate?.releaseTime,
+    rawCandidate?.release_time,
+    rawCandidate?.releaseDate,
+    rawCandidate?.release_date
+  );
   if (rawDate !== null) {
     const parsed = new Date(rawDate).getFullYear();
     if (Number.isFinite(parsed)) return String(parsed);
@@ -564,6 +590,9 @@ function extractRawCandidateType(rawCandidate) {
     rawCandidate?.typeDescription,
     rawCandidate?.type,
     rawCandidate?.type_name,
+    rawCandidate?.cat_name,
+    rawCandidate?.classify,
+    rawCandidate?.categoryName,
     rawCandidate?.mediaType,
     rawCandidate?.category,
     rawCandidate?.channel,
@@ -579,8 +608,15 @@ function extractRawCandidateImage(rawCandidate) {
     rawCandidate?.imgUrl,
     rawCandidate?.cover,
     rawCandidate?.coverUrl,
+    rawCandidate?.coverImageH,
+    rawCandidate?.coverImageV,
     rawCandidate?.poster,
     rawCandidate?.pic,
+    rawCandidate?.horizontal_picture,
+    rawCandidate?.image?.thumb,
+    rawCandidate?.image?.posterThumb,
+    rawCandidate?.image?.poster,
+    rawCandidate?.image?.url,
     ''
   ));
 }
@@ -591,9 +627,12 @@ function extractRawCandidateEpisodeCount(rawCandidate, typeDescription = '') {
     rawCandidate?.ep_size,
     rawCandidate?.episodesCount,
     rawCandidate?.totalEpisode,
+    rawCandidate?.total,
+    rawCandidate?.total_video_count,
     rawCandidate?.videoNum,
     Array.isArray(rawCandidate?.episodes) ? rawCandidate.episodes.length : null,
     Array.isArray(rawCandidate?._eps) ? rawCandidate._eps.length : null,
+    Array.isArray(rawCandidate?.seriesPlaylinks) ? rawCandidate.seriesPlaylinks.length : null,
     null
   ));
   if (Number.isFinite(count) && count > 0) return count;
@@ -602,7 +641,7 @@ function extractRawCandidateEpisodeCount(rawCandidate, typeDescription = '') {
 }
 
 function buildGenericLazySourceSummary(sourceName, rawCandidate) {
-  const identity = extractRawCandidateIdentity(rawCandidate);
+  const identity = extractRawCandidateIdentity(rawCandidate, sourceName);
   if (identity === null) return null;
 
   const bangumiId = String(identity);
@@ -612,7 +651,16 @@ function buildGenericLazySourceSummary(sourceName, rawCandidate) {
   const title = extractRawCandidateTitle(rawCandidate, bangumiId);
   if (!title) return null;
   const year = extractRawCandidateYear(rawCandidate, title);
-  const typeDescription = extractRawCandidateType(rawCandidate);
+  const source = resolveSourceInstance(sourceName);
+  const rawTypeDescription = extractRawCandidateType(rawCandidate);
+  const rawCategory = rawCandidate?.category;
+  const typeDescription = sourceName === 'hanjutv'
+    && rawCategory !== undefined
+    && rawCategory !== null
+    && Number.isFinite(Number(rawCategory))
+    && typeof source?.getCategory === 'function'
+    ? source.getCategory(rawCategory)
+    : rawTypeDescription;
   const episodeCount = extractRawCandidateEpisodeCount(rawCandidate, typeDescription);
   const aliases = [
     ...(Array.isArray(rawCandidate?.aliases) ? rawCandidate.aliases : []),
@@ -728,7 +776,7 @@ async function buildFullAnimeFromLazyDescriptor(descriptor, detailStore = null) 
   const sourceHandleOptions = {
     detailStore: requestDetailStore,
     querySeason: descriptor.querySeason,
-    preferAnimeId: getRawCandidateId(descriptor.rawCandidate),
+    preferAnimeId: getRawCandidateId(descriptor.rawCandidate, descriptor.source),
     preferSource: descriptor.source,
   };
 
@@ -750,7 +798,7 @@ async function materializeLazyDetailDescriptor(idParam, detailStore = null, sour
     return null;
   }
 
-  const pendingKey = `${descriptor.source}:${getRawCandidateId(descriptor.rawCandidate) || idParam}`;
+  const pendingKey = `${descriptor.source}:${getRawCandidateId(descriptor.rawCandidate, descriptor.source) || idParam}`;
   if (PENDING_LAZY_DETAIL_MATERIALIZATIONS.has(pendingKey)) {
     return await PENDING_LAZY_DETAIL_MATERIALIZATIONS.get(pendingKey);
   }
@@ -1445,17 +1493,19 @@ export async function searchAnime(url, preferAnimeId = null, preferSource = null
     await updateLocalRedisCaches();
   }
 
-  // 缓存搜索结果
-  if (curAnimes.length > 0) {
-    setSearchCache(searchCacheKey, curAnimes, requestAnimeDetailsMap);
+  const responseAnimes = curAnimes.map(({ links, ...pureAnime }) => pureAnime);
+
+  // 缓存搜索结果；详情 links 已通过 requestAnimeDetailsMap/animeDetailsCache 保存，响应缓存只保留摘要。
+  if (responseAnimes.length > 0) {
+    setSearchCache(searchCacheKey, responseAnimes, requestAnimeDetailsMap);
   }
 
-  resultCount = curAnimes.length;
+  resultCount = responseAnimes.length;
   return jsonResponse({
     errorCode: 0,
     success: true,
     errorMessage: "",
-    animes: curAnimes,
+    animes: responseAnimes,
   });
   } finally {
     perfCollector?.end(totalPerfToken, { cacheHit, resultCount });

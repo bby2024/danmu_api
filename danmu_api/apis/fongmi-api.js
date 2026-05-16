@@ -18,6 +18,23 @@ const FONGMI_EPISODE_CLEAN_RULES = [
   [/[_~.-]+/g, ' ']
 ];
 const FONGMI_MEDIA_NOISE_PATTERN = /\b(?:2160p|1080p|720p|4k|web-?dl|web-?rip|blu-?ray|hdr|dv|x265|x264|h\.?265|h\.?264|60fps)\b/i;
+const FONGMI_EPISODE_PATTERNS = [
+  { pattern: /[Ss]\d{1,2}\s*[Ee]0*(\d{1,4})/ },
+  { pattern: /(?:第\s*)0*(\d{1,4})\s*[集话話回期章段篇]/ },
+  { pattern: /(?:第\s*)?[零一二两三四五六七八九十百〇]+\s*[集话話回期章段篇]/, chinese: true },
+  { pattern: /(?:ep|episode|e)\.?\s*0*(\d{1,4})/i },
+  { pattern: /(?:正在)?播放[：:]\s*0*(\d{1,4})/ },
+  { pattern: /(?:第\s*)?[零一二两三四五六七八九十百〇\d]+\s*季\s*[|｜]\s*0*(\d{1,4})/ },
+  { pattern: /^[\[【\(（]\s*0*(\d{1,4})\s*[\]】\)）]$/ },
+  { pattern: /@@@\s*0*(\d{1,4})(?:\D|$)/ },
+  { pattern: /(?:^|[\s_\-])0*(\d{1,4})x(?:[\s_\-]|$)/i },
+  { pattern: /\s0*(\d{1,4})\.(?:mp4|mkv|avi|mov|m4v|ts|flv|1080|720|4k|2k)/i },
+  { pattern: /[_\-]\s*0*(\d{1,4})(?:\s|$|\.)/ },
+  { pattern: /\s0*(\d{1,4})\s/ },
+  { pattern: /\s0*(\d{1,4})$/ },
+  { pattern: /^0*(\d{1,4})\s/ },
+  { pattern: /([^\d])0*(\d{1,3})$/, group: 2 },
+];
 
 function getHeader(headers, name) {
   if (!headers) return '';
@@ -270,8 +287,31 @@ function isDateLikeEpisode(value) {
   return Boolean(extractDateDigits(value));
 }
 
+function parseFongmiPatternNumber(value, { chinese = false } = {}) {
+  if (value === undefined || value === null) return null;
+  if (chinese) {
+    const text = String(value);
+    return parseChineseEpisodeNumber(/[集话話回期章段篇]/.test(text) ? text : `第${text}集`);
+  }
+  const num = parseInt(String(value), 10);
+  if (!Number.isFinite(num) || num <= 0 || num >= 10000) return null;
+  if (num >= 1900 && num <= 2099) return null;
+  return num;
+}
+
 function extractFongmiEpisodeNumber(episode) {
-  const normalizedEpisode = normalizeFongmiEpisodeByRegex(episode);
+  const rawText = String(episode || '').trim();
+  if (!rawText) return null;
+  if (isDateLikeEpisode(rawText)) return null;
+
+  for (const { pattern, group = 1, chinese = false } of FONGMI_EPISODE_PATTERNS) {
+    const match = rawText.match(pattern);
+    if (!match) continue;
+    const num = parseFongmiPatternNumber(chinese ? match[0] : match[group], { chinese });
+    if (num !== null) return num;
+  }
+
+  const normalizedEpisode = normalizeFongmiEpisodeByRegex(rawText);
   if (!normalizedEpisode) return null;
   if (isDateLikeEpisode(normalizedEpisode)) return null;
 
@@ -288,7 +328,8 @@ function extractFongmiEpisodeNumber(episode) {
   for (const pattern of patterns) {
     const match = normalizedEpisode.match(pattern);
     if (match) {
-      return parseInt(match[1], 10);
+      const num = parseFongmiPatternNumber(match[1]);
+      if (num !== null) return num;
     }
   }
 
@@ -447,7 +488,9 @@ function scoreFongmiEpisodeMatch(candidate, targetEpisode) {
 
 function finalizeFongmiItems(items, targetEpisode) {
   const seen = new Set();
-  return items
+  const targetNum = extractFongmiEpisodeNumber(targetEpisode);
+  const targetDate = extractDateDigits(targetEpisode);
+  const scoredItems = items
     .map((item, order) => ({
       ...item,
       order,
@@ -458,7 +501,18 @@ function finalizeFongmiItems(items, targetEpisode) {
       if (!item.url || seen.has(item.url)) return false;
       seen.add(item.url);
       return true;
-    })
+    });
+
+  let narrowedItems = scoredItems;
+  if ((targetNum !== null || targetDate) && scoredItems.length > 0) {
+    const bestScore = scoredItems[0].score;
+    // 明确传入集数/日期时，只返回最高分命中的候选；没有有效命中时仍保持原候选列表兜底。
+    if (bestScore >= 4000) {
+      narrowedItems = scoredItems.filter(item => item.score === bestScore);
+    }
+  }
+
+  return narrowedItems
     .slice(0, MAX_FONGMI_CANDIDATES)
     .map(({ name, url }) => ({ name, url }));
 }

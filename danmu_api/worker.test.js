@@ -723,6 +723,64 @@ test('Fongmi standard entry should accept GET aliases and normalize episode numb
   }
 });
 
+test('Fongmi should recognize cloud-drive episode naming patterns from upstream', async () => {
+  const cases = [
+    ['[05]', 5],
+    ['【05】', 5],
+    ['正在播放：12', 12],
+    ['第1季|18', 18],
+    ['剧名@@@5', 5],
+    ['剧名05', 5],
+    ['2025-05-13', 13],
+  ];
+
+  for (const [episodeText, expectedEpisode] of cases) {
+    resetFongmiState();
+
+    try {
+      const anime = {
+        animeId: 910020 + expectedEpisode,
+        bangumiId: String(910020 + expectedEpisode),
+        animeTitle: '网盘命名番剧',
+        type: 'tvseries',
+        typeDescription: 'TV',
+        imageUrl: '',
+        startDate: '2025-01-01T00:00:00.000Z',
+        episodeCount: 18,
+        rating: 0,
+        isFavorited: true,
+        source: 'tencent',
+        links: Array.from({ length: 18 }, (_, index) => {
+          const num = index + 1;
+          const dateSuffix = num === 13 ? ' 2025-05-13' : '';
+          return {
+            id: 43000 + num,
+            url: `https://v.qq.com/x/cover/fongmi-cloud/ep${num}.html`,
+            title: `【qq】 第${num}集${dateSuffix}`
+          };
+        })
+      };
+      cacheFongmiAnime(anime);
+
+      const req = new MockRequest(urlPrefix + '/token123/api/v2/fongmi/danmaku?name=' + encodeURIComponent(anime.animeTitle) + '&episode=' + encodeURIComponent(episodeText), {
+        method: 'GET'
+      });
+      const res = await handleRequest(req, { TOKEN: 'token123', RATE_LIMIT_MAX_REQUESTS: '0', USE_BANGUMI_DATA: 'false' }, 'test', '127.0.0.1');
+      const body = await parseResponse(res);
+
+      assert.equal(res.status, 200, episodeText);
+      assert.deepEqual(body, [
+        {
+          name: `网盘命名番剧 【qq】 第${expectedEpisode}集${expectedEpisode === 13 ? ' 2025-05-13' : ''}`,
+          url: `${urlPrefix}/token123/api/v2/comment/${43000 + expectedEpisode}.xml`
+        }
+      ], episodeText);
+    } finally {
+      resetFongmiState();
+    }
+  }
+});
+
 test('Fongmi danmaku alias should accept POST and keep XML suffix URLs', async () => {
   resetFongmiState();
 

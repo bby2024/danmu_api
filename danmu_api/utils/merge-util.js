@@ -2472,6 +2472,13 @@ async function processMergeTask(params) {
                   hasMergedAny = true;
                   actualMergedSources.push(secSource);
                   contentSignatureParts.push(match.animeId);
+                  const mergedAliases = [
+                      ...(Array.isArray(derivedAnime.aliases) ? derivedAnime.aliases : []),
+                      ...(Array.isArray(derivedMatch.aliases) ? derivedMatch.aliases : [])
+                  ].map(alias => String(alias || '').trim()).filter(Boolean);
+                  if (mergedAliases.length > 0) {
+                      derivedAnime.aliases = Array.from(new Set(mergedAliases));
+                  }
               } else log("info", `${logPrefix} 关联取消: [${currentPrimarySource}] ${logTitleA} <-> [${secSource}] ${logTitleB} (匹配率过低: ${mergedCount}/${Math.max(filteredPLinksWithIndex.length, filteredMLinksWithIndex.length)})`);
             }
         }

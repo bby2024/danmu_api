@@ -110,3 +110,29 @@ test('findSecondaryMatches should still match through secondary aliases', () => 
   const matches = findSecondaryMatches(primary, [secondary]);
   assert.deepEqual(matches.map(item => item.animeId), [9202]);
 });
+
+test('applyMergeLogic should keep aliases from merged secondary sources', async () => {
+  resetRuntime({ MERGE_SOURCE_PAIRS: 'tencent&iqiyi' });
+
+  addAnime(createAnime({
+    animeId: 9301,
+    source: 'tencent',
+    title: '别名合并守护者',
+    aliases: ['主源别名']
+  }));
+  addAnime(createAnime({
+    animeId: 9302,
+    source: 'iqiyi',
+    title: '别名合并守护者',
+    aliases: ['副源别名', 'Alt Merge Guardian']
+  }));
+
+  const curAnimes = snapshotCurAnimes();
+  await applyMergeLogic(curAnimes);
+
+  const mergedAnime = curAnimes.find(item => item.source === 'tencent');
+  assert.ok(mergedAnime, 'expected merged primary anime');
+  assert.ok(mergedAnime.aliases.includes('主源别名'));
+  assert.ok(mergedAnime.aliases.includes('副源别名'));
+  assert.ok(mergedAnime.aliases.includes('Alt Merge Guardian'));
+});

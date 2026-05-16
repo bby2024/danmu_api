@@ -11,6 +11,12 @@ import YoukuSource from './sources/youku.js';
 import IqiyiSource from './sources/iqiyi.js';
 import MangoSource from './sources/mango.js';
 import BilibiliSource from './sources/bilibili.js';
+import Kan360Source from './sources/kan360.js';
+import TMDBSource from './sources/tmdb.js';
+import DoubanSource from './sources/douban.js';
+import RenrenSource from './sources/renren.js';
+import BahamutSource from './sources/bahamut.js';
+import CustomSource from './sources/custom.js';
 import MiguSource from './sources/migu.js';
 import SohuSource from './sources/sohu.js';
 import LeshiSource from './sources/leshi.js';
@@ -20,6 +26,7 @@ import AcfunSource from './sources/acfun.js';
 import AiyifanSource from './sources/aiyifan.js';
 import AnimekoSource from './sources/animeko.js';
 import EzdmwSource from './sources/ezdmw.js';
+import HanjutvSource from './sources/hanjutv.js';
 
 function resetRuntime() {
   Globals.init({
@@ -393,6 +400,13 @@ test('lazy public Dandan search should not fan out bangumi detail requests until
 });
 
 const OFFICIAL_SOURCE_MATRIX = [
+  ['360', Kan360Source],
+  ['tmdb', TMDBSource],
+  ['douban', DoubanSource],
+  ['renren', RenrenSource],
+  ['hanjutv', HanjutvSource],
+  ['bahamut', BahamutSource],
+  ['custom', CustomSource],
   ['tencent', TencentSource],
   ['youku', YoukuSource],
   ['iqiyi', IqiyiSource],
@@ -487,6 +501,156 @@ function fullOfficialSourceEnv() {
     USE_BANGUMI_DATA: 'false',
   };
 }
+
+test('lazy Hanjutv search summary should preserve nested poster and publish year metadata', async () => {
+  resetRuntime();
+  Globals.sourceOrderArr = ['hanjutv'];
+  Globals.useBangumiData = false;
+  const originalSearch = HanjutvSource.prototype.search;
+
+  HanjutvSource.prototype.search = async () => [{
+    sid: 'MdcTscpxpH1EyBiTr417',
+    name: '打架吧鬼神',
+    category: 1,
+    image: {
+      thumb: 'https://img.example/hanjutv-thumb.jpg',
+      poster: 'https://img.example/hanjutv-poster.jpg',
+    },
+    publishTime: 1468166400000,
+    totalEpisode: 16,
+    animeId: 376282,
+    _variant: 'tv',
+  }];
+
+  try {
+    const response = await handleRequest(
+      new Request('https://example.test/api/v2/search/anime?keyword=%E6%89%93%E6%9E%B6%E5%90%A7%E9%AC%BC%E7%A5%9E'),
+      {
+        LOG_LEVEL: 'error',
+        SOURCE_ORDER: 'hanjutv',
+        MERGE_SOURCE_PAIRS: '',
+        MAX_ANIMES: '1000',
+        SEARCH_CACHE_MINUTES: '30',
+        RATE_LIMIT_MAX_REQUESTS: '0',
+        USE_BANGUMI_DATA: 'false',
+      },
+      'test',
+      '127.0.0.1'
+    );
+    const body = await response.json();
+
+    assert.equal(body.success, true);
+    assert.equal(body.animes.length, 1);
+    assert.equal(body.animes[0].source, 'hanjutv');
+    assert.equal(body.animes[0].animeTitle, '打架吧鬼神(2016)【韩剧】from hanjutv');
+    assert.equal(body.animes[0].imageUrl, 'https://img.example/hanjutv-thumb.jpg');
+    assert.equal(body.animes[0].startDate, '2016-01-01T00:00:00Z');
+    assert.equal(body.animes[0].episodeCount, 16);
+    assert.equal('links' in body.animes[0], false);
+  } finally {
+    HanjutvSource.prototype.search = originalSearch;
+  }
+});
+
+test('lazy generic summaries should preserve legacy name/img/url shaped source metadata', async () => {
+  resetRuntime();
+  const originalMiguSearch = MiguSource.prototype.search;
+  const originalXiguaSearch = XiguaSource.prototype.search;
+  const originalMaiduiduiSearch = MaiduiduiSource.prototype.search;
+
+  MiguSource.prototype.search = async () => [{
+    name: '非标懒搜索测试',
+    type: '电视剧',
+    year: '2025',
+    img: 'https://img.example/migu.jpg',
+    url: 'https://v3-sc.miguvideo.com/program/v4/cont/content-info/migu-ep-1/1',
+    epsId: 'migu-ep-1',
+  }];
+  XiguaSource.prototype.search = async () => [{
+    name: '非标懒搜索测试',
+    type: '电视剧',
+    year: '2024',
+    img: 'https://img.example/xigua.jpg',
+    url: 'https://m.ixigua.com/video/1234567890',
+  }];
+  MaiduiduiSource.prototype.search = async () => [{
+    name: '非标懒搜索测试',
+    type: '剧集',
+    year: '2023',
+    img: 'https://img.example/maiduidui.jpg',
+    url: 'maiduidui-uuid-1',
+  }];
+
+  try {
+    const response = await handleRequest(
+      new Request('https://example.test/api/v2/search/anime?keyword=%E9%9D%9E%E6%A0%87%E6%87%92%E6%90%9C%E7%B4%A2%E6%B5%8B%E8%AF%95'),
+      {
+        LOG_LEVEL: 'error',
+        SOURCE_ORDER: 'migu,xigua,maiduidui',
+        MERGE_SOURCE_PAIRS: '',
+        MAX_ANIMES: '1000',
+        SEARCH_CACHE_MINUTES: '30',
+        RATE_LIMIT_MAX_REQUESTS: '0',
+        USE_BANGUMI_DATA: 'false',
+      },
+      'test',
+      '127.0.0.1'
+    );
+    const body = await response.json();
+
+    assert.equal(body.success, true);
+    assert.equal(body.animes.length, 3);
+
+    const bySource = new Map(body.animes.map(anime => [anime.source, anime]));
+    assert.equal(bySource.get('migu')?.bangumiId, 'migu-ep-1');
+    assert.equal(bySource.get('migu')?.imageUrl, 'https://img.example/migu.jpg');
+    assert.equal(bySource.get('migu')?.startDate, '2025-01-01T00:00:00Z');
+    assert.equal(bySource.get('xigua')?.bangumiId, '1234567890');
+    assert.equal(bySource.get('xigua')?.imageUrl, 'https://img.example/xigua.jpg');
+    assert.equal(bySource.get('xigua')?.startDate, '2024-01-01T00:00:00Z');
+    assert.equal(bySource.get('maiduidui')?.bangumiId, 'maiduidui-uuid-1');
+    assert.equal(bySource.get('maiduidui')?.imageUrl, 'https://img.example/maiduidui.jpg');
+    assert.equal(bySource.get('maiduidui')?.startDate, '2023-01-01T00:00:00Z');
+    assert.ok(body.animes.every(anime => !('links' in anime)));
+  } finally {
+    MiguSource.prototype.search = originalMiguSearch;
+    XiguaSource.prototype.search = originalXiguaSearch;
+    MaiduiduiSource.prototype.search = originalMaiduiduiSearch;
+  }
+});
+
+test('plain manual search should return poster year type and episode summary for every enabled source without links', async () => {
+  resetRuntime();
+  const officialStub = installOfficialSourcePrototypeStubs();
+
+  try {
+    const response = await handleRequest(
+      new Request('https://example.test/api/v2/search/anime?keyword=%E5%85%A8%E6%BA%90%E6%87%92%E6%90%9C%E7%B4%A2%E6%B5%8B%E8%AF%95'),
+      fullOfficialSourceEnv(),
+      'test',
+      '127.0.0.1'
+    );
+    const body = await response.json();
+
+    assert.equal(body.success, true);
+    assert.equal(body.animes.length, OFFICIAL_SOURCE_MATRIX.length);
+    assert.equal(officialStub.totalHandleCalls(), 0, 'manual lazy search must not materialize any source during the search step');
+
+    const bySource = new Map(body.animes.map(anime => [anime.source, anime]));
+    for (const [source] of OFFICIAL_SOURCE_MATRIX) {
+      const anime = bySource.get(source);
+      assert.ok(anime, `missing ${source} summary`);
+      assert.equal(anime.bangumiId, `${source}-media-1`, `${source} bangumiId should preserve raw identity`);
+      assert.equal(anime.imageUrl, `https://img.example/${source}.jpg`, `${source} poster should be returned`);
+      assert.equal(anime.startDate, '2026-01-01T00:00:00Z', `${source} year should be normalized into startDate`);
+      assert.equal(anime.typeDescription, '动漫', `${source} type should be returned`);
+      assert.equal(anime.episodeCount, 1, `${source} episode count should be returned`);
+      assert.equal('links' in anime, false, `${source} search summary must not expose links`);
+    }
+  } finally {
+    officialStub.restore();
+  }
+});
 
 test('lazy public search with all official sources should not call source handleAnimes until a result is selected', async () => {
   resetRuntime();
