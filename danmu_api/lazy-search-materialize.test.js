@@ -117,6 +117,112 @@ test('lazy manual VOD search should keep API schema and materialize details on b
   }
 });
 
+test('lazy VOD search cache hit should restore descriptors before bangumi materialization', async () => {
+  resetRuntime();
+  const vodMock = mockVodFetch([
+    {
+      vod_id: 940011,
+      vod_name: '懒加载缓存恢复番剧',
+      vod_year: '2026',
+      type_name: 'TV动画',
+      vod_pic: '',
+      vod_play_from: 'qq',
+      vod_play_url: '第1集$https://vod.example/cache-restore/ep1#第2集$https://vod.example/cache-restore/ep2',
+    },
+  ]);
+
+  try {
+    const searchUrl = new URL('https://example.test/api/v2/search/anime?keyword=%E6%87%92%E5%8A%A0%E8%BD%BD%E7%BC%93%E5%AD%98%E6%81%A2%E5%A4%8D%E7%95%AA%E5%89%A7');
+    const firstResponse = await searchAnime(searchUrl, null, null, new Map(), { lazySearch: true });
+    const firstBody = await firstResponse.json();
+    assert.equal(firstBody.success, true);
+    assert.equal(firstBody.animes.length, 1);
+    assert.ok(Globals.lazyDetailDescriptors.has('vod:940011'), 'first lazy search should register descriptor');
+    assert.equal(vodMock.calls.length, 1);
+
+    Globals.lazyDetailDescriptors = new Map();
+    Globals.animes = [];
+    Globals.episodeIds = [];
+
+    const cachedResponse = await searchAnime(searchUrl, null, null, new Map(), { lazySearch: true });
+    const cachedBody = await cachedResponse.json();
+    assert.equal(cachedBody.success, true);
+    assert.equal(cachedBody.animes.length, 1);
+    assert.equal(vodMock.calls.length, 1, 'second lazy search should hit cache instead of refetching VOD');
+    assert.ok(Globals.lazyDetailDescriptors.has('vod:940011'), 'cache hit should rehydrate the lazy descriptor');
+
+    const bangumiResponse = await getBangumi('/api/v2/bangumi/940011', null, 'vod');
+    const bangumiBody = await bangumiResponse.json();
+    assert.equal(bangumiBody.success, true);
+    assert.equal(bangumiBody.bangumi.episodes.length, 2);
+    assert.equal(bangumiBody.bangumi.episodes[0].episodeTitle, '【qq】 第1集');
+  } finally {
+    vodMock.restore();
+  }
+});
+
+test('lazy VOD search should use source-aware bangumi ids when multiple servers return the same vod_id', async () => {
+  resetRuntime();
+  Globals.init({
+    LOG_LEVEL: 'error',
+    SOURCE_ORDER: 'vod',
+    VOD_SERVERS: 'MockA@https://mock-vod-a.example,MockB@https://mock-vod-b.example',
+    VOD_RETURN_MODE: 'all',
+    VOD_REQUEST_TIMEOUT: '1000',
+    MERGE_SOURCE_PAIRS: '',
+    MAX_ANIMES: '1000',
+    SEARCH_CACHE_MINUTES: '30',
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const textUrl = String(url);
+    const fromA = textUrl.includes('mock-vod-a.example');
+    return new Response(JSON.stringify({
+      list: [
+        {
+          vod_id: 940020,
+          vod_name: '同ID多站番剧',
+          vod_year: '2026',
+          type_name: 'TV动画',
+          vod_pic: '',
+          vod_play_from: 'qq',
+          vod_play_url: fromA
+            ? 'A第1集$https://vod-a.example/same-id/ep1'
+            : 'B第1集$https://vod-b.example/same-id/ep1',
+        },
+      ],
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  try {
+    const response = await searchAnime(
+      new URL('https://example.test/api/v2/search/anime?keyword=%E5%90%8CID%E5%A4%9A%E7%AB%99%E7%95%AA%E5%89%A7'),
+      null,
+      null,
+      new Map(),
+      { lazySearch: true }
+    );
+    const body = await response.json();
+    assert.equal(body.success, true);
+    assert.equal(body.animes.length, 2);
+
+    const bangumiIds = body.animes.map(anime => anime.bangumiId);
+    assert.equal(new Set(bangumiIds).size, 2, 'same vod_id from different VOD servers must be selectable separately');
+    assert.ok(bangumiIds.every(id => id !== '940020'), 'duplicate VOD summaries should not expose the ambiguous raw id as bangumiId');
+
+    const firstBangumi = await (await getBangumi(`/api/v2/bangumi/${encodeURIComponent(bangumiIds[0])}`, null, 'vod')).json();
+    const secondBangumi = await (await getBangumi(`/api/v2/bangumi/${encodeURIComponent(bangumiIds[1])}`, null, 'vod')).json();
+    const episodeTitles = [
+      firstBangumi.bangumi.episodes[0].episodeTitle,
+      secondBangumi.bangumi.episodes[0].episodeTitle,
+    ].sort();
+    assert.deepEqual(episodeTitles, ['【qq】 A第1集', '【qq】 B第1集']);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 async function prepareLazyVodDescriptor(vodId = 940002) {
   const vodMock = mockVodFetch([
     {

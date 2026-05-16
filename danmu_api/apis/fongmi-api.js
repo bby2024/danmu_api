@@ -25,7 +25,7 @@ const FONGMI_EPISODE_PATTERNS = [
   { pattern: /(?:ep|episode|e)\.?\s*0*(\d{1,4})/i },
   { pattern: /(?:正在)?播放[：:]\s*0*(\d{1,4})/ },
   { pattern: /(?:第\s*)?[零一二两三四五六七八九十百〇\d]+\s*季\s*[|｜]\s*0*(\d{1,4})/ },
-  { pattern: /^[\[【\(（]\s*0*(\d{1,4})\s*[\]】\)）]$/ },
+  { pattern: /[\[【\(（]\s*0*(\d{1,4})\s*[\]】\)）]/ },
   { pattern: /@@@\s*0*(\d{1,4})(?:\D|$)/ },
   { pattern: /(?:^|[\s_\-])0*(\d{1,4})x(?:[\s_\-]|$)/i },
   { pattern: /\s0*(\d{1,4})\.(?:mp4|mkv|avi|mov|m4v|ts|flv|1080|720|4k|2k)/i },
@@ -217,7 +217,7 @@ function buildFongmiSearchKeywords(name) {
 }
 
 function parseChineseEpisodeNumber(text) {
-  const match = text.match(/(?:第\s*)?([零〇一二两三四五六七八九十百]{1,8})\s*[集话話回期]/);
+  const match = text.match(/(?:第\s*)?([零〇一二两三四五六七八九十百]{1,8})\s*[集话話回期章段篇]/);
   if (!match) return null;
 
   const digits = {
@@ -302,7 +302,6 @@ function parseFongmiPatternNumber(value, { chinese = false } = {}) {
 function extractFongmiEpisodeNumber(episode) {
   const rawText = String(episode || '').trim();
   if (!rawText) return null;
-  if (isDateLikeEpisode(rawText)) return null;
 
   for (const { pattern, group = 1, chinese = false } of FONGMI_EPISODE_PATTERNS) {
     const match = rawText.match(pattern);
@@ -344,12 +343,13 @@ function normalizeEpisode(episode) {
     return 'movie';
   }
 
+  const episodeNumber = extractFongmiEpisodeNumber(text);
+  const pureDateLike = /^(?:\d{4}[-/.]?\d{1,2}[-/.]?\d{1,2}|\d{8})$/.test(text);
+  if (episodeNumber !== null && !pureDateLike) return String(episodeNumber);
+
   if (isDateLikeEpisode(text)) {
     return '';
   }
-
-  const episodeNumber = extractFongmiEpisodeNumber(text);
-  if (episodeNumber !== null) return String(episodeNumber);
 
   return '';
 }

@@ -727,6 +727,12 @@ test('Fongmi should recognize cloud-drive episode naming patterns from upstream'
   const cases = [
     ['[05]', 5],
     ['【05】', 5],
+    ['网盘命名番剧 [05]', 5],
+    ['网盘命名番剧【05】', 5],
+    ['Show Name (05)', 5],
+    ['S01E05 2025-05-13', 5],
+    ['2025-05-13 S01E05', 5],
+    ['网盘命名番剧.EP05.2025.05.13', 5],
     ['正在播放：12', 12],
     ['第1季|18', 18],
     ['剧名@@@5', 5],

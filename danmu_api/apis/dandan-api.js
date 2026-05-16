@@ -12,7 +12,7 @@ import {
 } from "../utils/cache-util.js";
 import { formatDanmuResponse, convertToDanmakuJson } from "../utils/danmu-util.js";
 import { applyOffset, resolveOffsetRule } from "../utils/offset-util.js";
-import { extractEpisodeTitle, convertChineseNumber, parseFileName, createDynamicPlatformOrder, normalizeSpaces, stripInvisibleChars, extractYear, titleMatches, extractAnimeInfo, extractSeasonNumberFromAnimeTitle, extractAnimeTitle, normalizeTitleForComparison, sanitizeSearchKeyword, normalizeUnicodeWhitespace, splitTitleAndTrailingSeasonEpisode, preferSeasonCandidatesIfPresent } from "../utils/common-util.js";
+import { extractEpisodeTitle, convertChineseNumber, parseFileName, createDynamicPlatformOrder, normalizeSpaces, stripInvisibleChars, extractYear, titleMatches, extractAnimeInfo, extractSeasonNumberFromAnimeTitle, extractAnimeTitle, normalizeTitleForComparison, sanitizeSearchKeyword, normalizeUnicodeWhitespace, splitTitleAndTrailingSeasonEpisode, preferSeasonCandidatesIfPresent, normalizeTitleCacheKey } from "../utils/common-util.js";
 import { generateValidStartDate } from "../utils/time-util.js";
 import { convertToAsciiSum } from "../utils/codec-util.js";
 import { getTMDBChineseTitle } from "../utils/tmdb-util.js";
@@ -278,7 +278,7 @@ function isLazyDetailDescriptorExpired(descriptor) {
   const createdAt = Number(descriptor?.createdAt || 0);
   if (!createdAt) return true;
   const ttlMinutes = Number(globals.searchCacheMinutes || 0);
-  if (!Number.isFinite(ttlMinutes) || ttlMinutes <= 0) return false;
+  if (!Number.isFinite(ttlMinutes) || ttlMinutes <= 0) return true;
   return (Date.now() - createdAt) / (1000 * 60) > ttlMinutes;
 }
 
@@ -296,6 +296,111 @@ function buildLazyDescriptorKey(source, id) {
   const normalizedId = String(id ?? '').trim();
   if (!normalizedSource || !normalizedId) return null;
   return `${normalizedSource}:${normalizedId}`;
+}
+
+function isPositiveSearchCacheWindow() {
+  const minutes = Number(globals.searchCacheMinutes);
+  return Number.isFinite(minutes) && minutes > 0;
+}
+
+function cloneLazyDescriptor(descriptor) {
+  if (!descriptor) return null;
+  return {
+    ...descriptor,
+    rawCandidate: descriptor.rawCandidate && typeof descriptor.rawCandidate === 'object'
+      ? { ...descriptor.rawCandidate }
+      : descriptor.rawCandidate,
+    identityIds: Array.isArray(descriptor.identityIds) ? [...descriptor.identityIds] : [],
+  };
+}
+
+function findSearchCacheEntry(cacheKey) {
+  if (!(globals.searchCache instanceof Map)) return null;
+  const candidates = [
+    cacheKey,
+    normalizeTitleCacheKey(cacheKey) || '',
+  ].filter(Boolean);
+
+  for (const key of candidates) {
+    if (globals.searchCache.has(key)) {
+      return globals.searchCache.get(key);
+    }
+  }
+  return null;
+}
+
+function collectLazyDescriptorsForSearchResults(results) {
+  if (!Array.isArray(results) || results.length === 0) return [];
+  const store = getLazyDetailDescriptorStore();
+  const descriptors = [];
+  const seen = new Set();
+
+  for (const anime of results) {
+    const source = anime?.source;
+    const keys = [
+      buildLazyDescriptorKey(source, anime?.bangumiId),
+      buildLazyDescriptorKey(source, anime?.animeId),
+    ].filter(Boolean);
+
+    for (const key of keys) {
+      const descriptor = store.get(key);
+      if (!descriptor || seen.has(descriptor)) continue;
+      seen.add(descriptor);
+      descriptors.push(cloneLazyDescriptor(descriptor));
+      break;
+    }
+  }
+
+  return descriptors;
+}
+
+function attachLazyDescriptorsToSearchCache(cacheKey, results) {
+  const cacheEntry = findSearchCacheEntry(cacheKey);
+  if (!cacheEntry) return;
+  const descriptors = collectLazyDescriptorsForSearchResults(results);
+  if (descriptors.length > 0) {
+    cacheEntry.lazyDetailDescriptors = descriptors;
+  }
+}
+
+function rehydrateLazyDescriptorsFromSearchCache(cacheKey) {
+  const cacheEntry = findSearchCacheEntry(cacheKey);
+  const descriptors = Array.isArray(cacheEntry?.lazyDetailDescriptors) ? cacheEntry.lazyDetailDescriptors : [];
+  if (descriptors.length === 0) return;
+  for (const descriptor of descriptors) {
+    const cloned = cloneLazyDescriptor(descriptor);
+    const summary = descriptor?.source === 'vod'
+      ? buildVodAnimeFromLazyDescriptor(cloned, false)
+      : descriptor?.source === 'dandan'
+        ? buildDandanAnimeFromLazyDescriptor(cloned, null, false)
+        : buildGenericLazySourceSummary(cloned?.source, cloned?.rawCandidate, cloned?.queryTitle, cloned?.querySeason, cloned);
+    registerLazyDescriptor(cloned, summary);
+  }
+}
+
+function pruneLazyDetailDescriptors() {
+  const store = getLazyDetailDescriptorStore();
+  for (const descriptor of [...new Set(store.values())]) {
+    if (isLazyDetailDescriptorExpired(descriptor)) {
+      removeLazyDetailDescriptor(descriptor);
+    }
+  }
+
+  const maxItems = Number(globals.searchCacheMaxItems || 200);
+  if (!Number.isFinite(maxItems) || maxItems <= 0) return;
+  const uniqueDescriptors = [...new Set(store.values())]
+    .sort((a, b) => Number(a?.createdAt || 0) - Number(b?.createdAt || 0));
+  while (uniqueDescriptors.length > maxItems) {
+    const descriptor = uniqueDescriptors.shift();
+    removeLazyDetailDescriptor(descriptor);
+  }
+}
+
+function buildVodScopedLazyId(vodName, rawId) {
+  const normalizedVodName = String(vodName || '').trim();
+  const normalizedId = String(rawId ?? '').trim();
+  if (!normalizedVodName || !normalizedId) return normalizedId;
+  return `${encodeURIComponent(normalizedVodName)}:${encodeURIComponent(normalizedId)}`;
 }
 
 function normalizeVodPlatform(platform) {
@@ -339,7 +444,7 @@ function buildVodAnimeFromLazyDescriptor(descriptor, includeLinks = false) {
 
   const anime = {
     animeId: Number(rawCandidate.vod_id),
-    bangumiId: String(rawCandidate.vod_id),
+    bangumiId: String(descriptor.publicBangumiId || rawCandidate.vod_id),
     animeTitle: `${rawCandidate.vod_name}(${rawCandidate.vod_year})【${rawCandidate.type_name}】from ${descriptor.vodName}`,
     type: rawCandidate.type_name,
     typeDescription: rawCandidate.type_name,
@@ -431,7 +536,7 @@ function buildDandanAnimeFromLazyDescriptor(descriptor, details = null, includeL
 }
 
 function registerLazyDescriptor(descriptor, summary) {
-  if (!summary) return null;
+  if (!summary || isLazyDetailDescriptorExpired(descriptor)) return null;
 
   descriptor.identityIds = [...new Set([
     ...(Array.isArray(descriptor.identityIds) ? descriptor.identityIds : []),
@@ -444,10 +549,13 @@ function registerLazyDescriptor(descriptor, summary) {
   const bangumiKey = buildLazyDescriptorKey(descriptor.source, summary.bangumiId);
   if (animeKey) store.set(animeKey, descriptor);
   if (bangumiKey) store.set(bangumiKey, descriptor);
+  pruneLazyDetailDescriptors();
   return summary;
 }
 
-function registerLazyVodDescriptor(rawCandidate, queryTitle, querySeason, vodName) {
+function registerLazyVodDescriptor(rawCandidate, queryTitle, querySeason, vodName, forceSourceAwareId = false) {
+  const rawId = getRawCandidateId(rawCandidate, 'vod');
+  const publicBangumiId = forceSourceAwareId ? buildVodScopedLazyId(vodName, rawId) : String(rawId || rawCandidate?.vod_id || '');
   const descriptor = {
     kind: 'lazy-detail',
     source: 'vod',
@@ -455,6 +563,7 @@ function registerLazyVodDescriptor(rawCandidate, queryTitle, querySeason, vodNam
     queryTitle,
     querySeason,
     vodName,
+    publicBangumiId,
     createdAt: Date.now(),
   };
   const summary = buildVodAnimeFromLazyDescriptor(descriptor, false);
@@ -474,14 +583,35 @@ function registerLazyDandanDescriptor(rawCandidate, queryTitle, querySeason) {
   return registerLazyDescriptor(descriptor, summary);
 }
 
-function buildLazyVodSearchSummaries(vodCandidates, queryTitle, querySeason, vodName) {
+function buildLazyVodSearchSummaries(vodCandidates, queryTitle, querySeason, vodName, duplicateVodIds = new Set()) {
   if (!Array.isArray(vodCandidates)) return [];
 
   const seasonPreferredAnimes = preferSeasonCandidatesIfPresent(vodCandidates, querySeason, anime => anime?.vod_name || '');
   return seasonPreferredAnimes
     .filter(anime => titleMatches(anime?.vod_name || '', queryTitle))
-    .map(anime => registerLazyVodDescriptor(anime, queryTitle, querySeason, vodName))
+    .map(anime => registerLazyVodDescriptor(
+      anime,
+      queryTitle,
+      querySeason,
+      vodName,
+      duplicateVodIds.has(String(getRawCandidateId(anime, 'vod') || ''))
+    ))
     .filter(Boolean);
+}
+
+function collectDuplicateVodCandidateIds(vodResults) {
+  const counts = new Map();
+  if (!Array.isArray(vodResults)) return new Set();
+  for (const vodResult of vodResults) {
+    if (!Array.isArray(vodResult?.list)) continue;
+    for (const candidate of vodResult.list) {
+      const id = getRawCandidateId(candidate, 'vod');
+      if (!id) continue;
+      const key = String(id);
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+  }
+  return new Set([...counts.entries()].filter(([, count]) => count > 1).map(([id]) => id));
 }
 
 function buildLazyDandanSearchSummaries(dandanCandidates, queryTitle, querySeason) {
@@ -1226,7 +1356,11 @@ export async function searchAnime(url, preferAnimeId = null, preferSource = null
   }
 
   const requestAnimeDetailsMap = detailStore instanceof Map ? detailStore : new Map();
-  const lazySearch = options?.lazySearch === true;
+  let lazySearch = options?.lazySearch === true;
+  if (lazySearch && !isPositiveSearchCacheWindow()) {
+    log("info", `[searchAnime] SEARCH_CACHE_MINUTES<=0，禁用公共懒搜索以避免返回不可物化的摘要`);
+    lazySearch = false;
+  }
   const sourceHandleOptions = {
     detailStore: requestAnimeDetailsMap,
     querySeason,
@@ -1258,6 +1392,9 @@ export async function searchAnime(url, preferAnimeId = null, preferSource = null
     resultCount: Array.isArray(cachedResults) ? cachedResults.length : 0,
   });
   if (cachedResults !== null) {
+    if (lazySearch) {
+      rehydrateLazyDescriptorsFromSearchCache(cacheKeyUsed);
+    }
     resultCount = cachedResults.length;
     return jsonResponse({
       errorCode: 0,
@@ -1401,11 +1538,12 @@ export async function searchAnime(url, preferAnimeId = null, preferSource = null
         if (key === 'vod') {
           // Vod 结果按服务器分组，handleAnimes 需要保留 vodName 这个兼容位置参数。
           const animesVodResults = resultData[key];
+          const duplicateVodIds = lazySearch ? collectDuplicateVodCandidateIds(animesVodResults) : new Set();
           if (animesVodResults && Array.isArray(animesVodResults)) {
             for (const vodResult of animesVodResults) {
               if (vodResult && vodResult.list && vodResult.list.length > 0) {
                 if (lazySearch) {
-                  curAnimes.push(...buildLazyVodSearchSummaries(vodResult.list, queryTitle, querySeason, vodResult.serverName));
+                  curAnimes.push(...buildLazyVodSearchSummaries(vodResult.list, queryTitle, querySeason, vodResult.serverName, duplicateVodIds));
                 } else {
                   await vodSource.handleAnimes(vodResult.list, queryTitle, curAnimes, vodResult.serverName, sourceHandleOptions);
                 }
@@ -1498,6 +1636,9 @@ export async function searchAnime(url, preferAnimeId = null, preferSource = null
   // 缓存搜索结果；详情 links 已通过 requestAnimeDetailsMap/animeDetailsCache 保存，响应缓存只保留摘要。
   if (responseAnimes.length > 0) {
     setSearchCache(searchCacheKey, responseAnimes, requestAnimeDetailsMap);
+    if (lazySearch) {
+      attachLazyDescriptorsToSearchCache(searchCacheKey, responseAnimes);
+    }
   }
 
   resultCount = responseAnimes.length;
@@ -2720,7 +2861,8 @@ export async function searchEpisodes(url) {
 
 // Extracted function for GET /api/v2/bangumi/:animeId
 export async function getBangumi(path, detailStore = null, source = null) {
-  const idParam = path.split("/").pop();
+  const rawIdParam = path.split("/").pop();
+  const idParam = decodeURIComponent(rawIdParam || '');
   let anime = resolveAnimeById(idParam, detailStore, source);
   if (!anime) {
     anime = await materializeLazyDetailDescriptor(idParam, detailStore, source);
