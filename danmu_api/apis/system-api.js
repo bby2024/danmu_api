@@ -4,6 +4,7 @@ import { HTML_TEMPLATE } from "../ui/template.js";
 import { formatLogMessage, log } from "../utils/log-util.js";
 import { HandlerFactory } from "../configs/handlers/handler-factory.js";
 import { createRuntimeHandler } from "../runtime/runtime-handler-factory.js";
+import { clearBangumiDataCache, initBangumiData } from "../utils/bangumi-data-util.js";
 
 function escapeForSingleQuotedJsString(value) {
   return String(value || "")
@@ -245,6 +246,18 @@ export async function handleClearCache() {
     globals.episodeDetailsCache = new Map();
     globals.lazyDetailDescriptors = new Map();
     globals.requestHistory = new Map();
+
+    try {
+      // 清理 Bangumi-Data 内存与磁盘缓存；若仍启用则异步重新加载，避免下一次查询冷启动过慢。
+      await clearBangumiDataCache(true);
+      if (globals.useBangumiData) {
+        initBangumiData(globals.deployPlatform, false).catch(e => {
+          log("warn", `[server] Bangumi-Data background reload failed: ${e.message}`);
+        });
+      }
+    } catch (bangumiError) {
+      log("error", `[server] Failed to clear Bangumi-Data cache: ${bangumiError.message}`);
+    }
     
     log("info", `[server] Memory cache cleared successfully`);
     
